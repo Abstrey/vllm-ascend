@@ -592,6 +592,30 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         worker.wait_for_save(meta)
         worker.kv_send_thread.add_stored_request.assert_called_with("r1")
         worker.kv_send_thread.add_request.assert_called_once()
+        # Default (save_async=False) keeps the synchronous visibility barrier.
+        self.assertFalse(worker.save_async)
+        worker.kv_send_thread.request_queue.join.assert_called_once()
+
+    def test_wait_for_save_async_skips_barrier(self):
+        worker = self._make_worker(extra_config={"save_async": True})
+        worker.kv_send_thread = MagicMock()
+
+        req = ReqMeta(
+            req_id="r1",
+            token_len_chunk=16,
+            block_ids=[0],
+            block_hashes=["h0"],
+            can_save=True,
+        )
+        meta = AscendConnectorMetadata(set(), set())
+        meta.add_request(req)
+        worker.wait_for_save(meta)
+        # The request is still enqueued for the send thread...
+        self.assertTrue(worker.save_async)
+        worker.kv_send_thread.add_stored_request.assert_called_with("r1")
+        worker.kv_send_thread.add_request.assert_called_once()
+        # ...but the per-step synchronous join barrier is skipped.
+        worker.kv_send_thread.request_queue.join.assert_not_called()
 
     def test_wait_for_save_skip_non_save(self):
         worker = self._make_worker()

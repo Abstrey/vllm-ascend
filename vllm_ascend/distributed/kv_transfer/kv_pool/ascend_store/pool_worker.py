@@ -99,6 +99,15 @@ class KVPoolWorker:
 
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        # Opt-in: when True, wait_for_save() does not block the step on the
+        # synchronous request_queue.join() store-visibility barrier. Stores
+        # still complete on the send thread and are reported asynchronously via
+        # get_finished(); the request's blocks are not freed until then, so KV
+        # is never read after free. The only behavioral change is that an
+        # immediately-following identical prompt may look up before the put has
+        # landed and miss (recompute) instead of hitting the pool. Default
+        # False preserves the current synchronous, visible-on-return behavior.
+        self.save_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("save_async", False)
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
@@ -633,10 +642,17 @@ class KVPoolWorker:
             )
             has_save_request = True
 
-        if has_save_request:
+        if has_save_request and not self.save_async:
             # vLLM expects wait_for_save() to make stores visible before the
             # request is reported as finished. Without this barrier a following
             # identical prompt can lookup before Mooncake put() has completed.
+            #
+            # When save_async is enabled we skip this synchronous barrier: the
+            # send thread still drains request_queue and completion is reported
+            # asynchronously through get_finished()/done_sending (the request's
+            # blocks are held until then, so the put never reads freed KV). This
+            # removes the per-step save tax from the critical path at the cost of
+            # store visibility being delayed by a few steps.
             self.kv_send_thread.request_queue.join()  # type: ignore[union-attr]
 
     def retrieve_layer(
