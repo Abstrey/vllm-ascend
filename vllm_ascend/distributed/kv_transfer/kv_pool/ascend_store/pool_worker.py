@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import os
 import threading
 from collections.abc import Generator
 
@@ -633,12 +634,10 @@ class KVPoolWorker:
             )
             has_save_request = True
 
-        if has_save_request:
-            # vLLM expects wait_for_save() to make stores visible before the
-            # request is reported as finished. Without this barrier a following
-            # identical prompt can lookup before Mooncake put() has completed.
+        if has_save_request and os.getenv("VLLM_ASCEND_KVPOOL_WAIT_FOR_SAVE", "0") == "1":
+            # Keep stores visible-before-finish only when explicitly requested.
+            # The default async path avoids blocking TTFT on backend put/save.
             self.kv_send_thread.request_queue.join()  # type: ignore[union-attr]
-
     def retrieve_layer(
         self,
         request: ReqMeta,

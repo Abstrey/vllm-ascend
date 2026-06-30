@@ -338,7 +338,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             block_hashes = [block_hashes[index] for index in missing_indices]
             key_block_ids = [key_block_ids[index] for index in missing_indices]
 
-            logger.info(
+            logger.debug(
                 "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s in group %d",
                 len(keys),
                 token_len // group_block_size,
@@ -567,7 +567,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.set_finished_request(req_meta.req_id)
         self.request_queue.task_done()
 
-        logger.info(
+        logger.debug(
             "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s",
             len(key_list),
             total_block,

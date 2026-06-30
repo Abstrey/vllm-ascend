@@ -276,7 +276,7 @@ class KVPoolScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=False,
         )
-        logger.info(
+        logger.debug(
             "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
             "need_to_allocate=%d load_async=%s use_layerwise=%s",
             request.request_id,
