@@ -263,6 +263,7 @@ class SparseKVOffloadManager:
         self.block_size = self._infer_group_block_sizes(self.kv_cache_config)
         self.topk_buffer_size = sparse_kv_offload_config.topk_buffer_size
         self.topk = sparse_kv_offload_config.topk
+        self.use_fused_overlap = bool(getattr(sparse_kv_offload_config, "use_fused_overlap", False))
 
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -395,6 +396,49 @@ class SparseKVOffloadManager:
             )
         return layer_id
 
+    def _restore_bfloat16_tensor(self, ptr: int, shape: list[int]) -> torch.Tensor:
+        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(ptr, shape)
+        if int(view.data_ptr()) != int(ptr):
+            raise RuntimeError(
+                "restore_bfloat16_tensor returned a tensor with unexpected data_ptr: "
+                f"expected={ptr}, got={view.data_ptr()}"
+            )
+        if list(view.shape) != list(shape):
+            raise RuntimeError(
+                "restore_bfloat16_tensor returned unexpected shape: "
+                f"expected={shape}, got={list(view.shape)}"
+            )
+        if view.dtype != torch.bfloat16:
+            raise RuntimeError(
+                f"restore_bfloat16_tensor returned unexpected dtype: {view.dtype}"
+            )
+        if not view.is_contiguous():
+            raise RuntimeError("restore_bfloat16_tensor requires a contiguous view")
+        return view
+
+    def get_fused_overlap_cpu_kv_inputs(
+        self,
+        layer_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return CPU full KV tensors used by fused_overlap decode.
+
+        On TP0 these are the owned CPU pools; on other ranks they are non-owning
+        GVA views restored after broadcast.
+        """
+        if not self.use_fused_overlap:
+            raise RuntimeError(
+                "get_fused_overlap_cpu_kv_inputs requires "
+                "sparse_kv_offload_config.use_fused_overlap=true"
+            )
+        layer_id = self._get_offload_layer_id(layer_name)
+        if layer_id >= len(self.k_caches_cpu) or layer_id >= len(self.v_caches_cpu):
+            raise RuntimeError(
+                "fused_overlap CPU KV views are not registered: "
+                f"layer_id={layer_id}, k_len={len(self.k_caches_cpu)}, "
+                f"v_len={len(self.v_caches_cpu)}"
+            )
+        return self.k_caches_cpu[layer_id], self.v_caches_cpu[layer_id]
+
     def register_kv_caches(
         self,
         kv_caches: dict[str, torch.Tensor],
@@ -487,6 +531,8 @@ class SparseKVOffloadManager:
         gvas_k_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
         gvas_v_tensor = torch.zeros([self.num_layers], dtype=torch.int64, device='npu')
         cpu_block_lens_tensor = torch.zeros([self.num_layers, 2], dtype=torch.int64, device='npu')
+        shape_k_tensor = torch.zeros([4], dtype=torch.int64, device='npu')
+        shape_v_tensor = torch.zeros([4], dtype=torch.int64, device='npu')
         if self.tp_rank == 0:
             for layer_id in range(self.num_layers):
                 k_cpu = self.k_caches_cpu[layer_id]
@@ -499,9 +545,17 @@ class SparseKVOffloadManager:
                 cpu_block_lens_tensor[layer_id, 1] = (
                     v_cpu.numel() * v_cpu.element_size() // self.kv_cache_config.num_blocks
                 )
+            shape_k_tensor.copy_(
+                torch.tensor(self.k_caches_cpu[0].shape, dtype=torch.int64, device='npu')
+            )
+            shape_v_tensor.copy_(
+                torch.tensor(self.v_caches_cpu[0].shape, dtype=torch.int64, device='npu')
+            )
         self.tp_group.broadcast(gvas_k_tensor, src=0)
         self.tp_group.broadcast(gvas_v_tensor, src=0)
         self.tp_group.broadcast(cpu_block_lens_tensor, src=0)
+        self.tp_group.broadcast(shape_k_tensor, src=0)
+        self.tp_group.broadcast(shape_v_tensor, src=0)
         for layer_id in range(self.num_layers):
             self.gvas_k_bases.append(gvas_k_tensor[layer_id].item())
             self.gvas_v_bases.append(gvas_v_tensor[layer_id].item())
@@ -509,6 +563,26 @@ class SparseKVOffloadManager:
                 cpu_block_lens_tensor[layer_id, 0].item(),
                 cpu_block_lens_tensor[layer_id, 1].item(),
             ))
+
+        if self.use_fused_overlap and self.tp_rank != 0:
+            cpu_k_shape = [int(x) for x in shape_k_tensor.tolist()]
+            cpu_v_shape = [int(x) for x in shape_v_tensor.tolist()]
+            self.k_caches_cpu = [
+                self._restore_bfloat16_tensor(ptr, cpu_k_shape)
+                for ptr in self.gvas_k_bases
+            ]
+            self.v_caches_cpu = [
+                self._restore_bfloat16_tensor(ptr, cpu_v_shape)
+                for ptr in self.gvas_v_bases
+            ]
+            logger.info(
+                "[fused_overlap_offload][init] restored shared CPU KV views on "
+                "tp_rank=%s layer_count=%s k_shape=%s v_shape=%s",
+                self.tp_rank,
+                self.num_layers,
+                cpu_k_shape,
+                cpu_v_shape,
+            )
 
         gvas_buffer_offset = 0
         gvas_buffer_size_bytes = self.max_num_topk_rows * self.topk * 2 * 8 # 2: k+v, 8: int64

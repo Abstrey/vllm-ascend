@@ -954,6 +954,7 @@ class SparseKVOffloadConfig:
 
     def __init__(self, vllm_config: "VllmConfig", user_config: dict[str, Any]):
         self.enabled = bool(user_config.get("enabled", False))
+        self.use_fused_overlap = bool(user_config.get("use_fused_overlap", False))
         if not self.enabled:
             return
 

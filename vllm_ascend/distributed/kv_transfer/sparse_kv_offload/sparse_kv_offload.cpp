@@ -431,6 +431,15 @@ compute_lru_resident_addrs(
     return num_tokens_to_load_sum;
 }
 
+at::Tensor restore_tensor(uintptr_t ptr_val, const std::vector<int64_t>& shape,
+                          torch::ScalarType dtype = torch::kBFloat16) {
+    if (ptr_val == 0) {
+        return at::Tensor();
+    }
+    auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+    return torch::from_blob(reinterpret_cast<void*>(ptr_val), shape, options);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     namespace py = pybind11;
@@ -438,4 +447,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "CPU LRU resident compact miss prepare with OpenMP row-level parallelism");
     m.def("compute_lru_resident_addrs", &compute_lru_resident_addrs,
           "Compute sparse H2D metadata for compact LRU resident miss loads");
+    m.def(
+        "restore_bfloat16_tensor",
+        [](uintptr_t ptr_val, const std::vector<int64_t>& shape) {
+            TORCH_CHECK(ptr_val != 0, "restore_bfloat16_tensor requires a non-zero pointer");
+            return restore_tensor(ptr_val, shape, torch::kBFloat16);
+        },
+        "Create a non-owning CPU bfloat16 tensor view for a shared GVA");
 }

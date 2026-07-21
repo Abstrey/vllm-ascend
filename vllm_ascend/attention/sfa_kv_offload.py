@@ -15,8 +15,15 @@ Data plane (see zsc-sfa-kv-offload-merge-plan.md):
   token's K/V is produced compute-only and committed D2H directly; top-k
   misses are loaded H2D into the resident (topk) buffer and a single
   resident SFA attention runs.
+- fused_overlap decode (optional via ``use_fused_overlap``): replace resident
+  onload + SFA with ``npu_fused_sparse_attention_overlap``, reading full KV
+  from the shared CPU pool while keeping a selection buffer on NPU.
 """
 
+from __future__ import annotations
+
+import os
+import re
 from typing import Any, TypeVar
 
 import torch
@@ -31,6 +38,7 @@ from vllm.logger import logger
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.fused_overlap_debug import dump_op_inputs, dump_op_output
 from vllm_ascend.attention.sfa_v1 import (
     AscendSFAImpl,
     AscendSFAMetadata,
@@ -174,6 +182,38 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 "indexer cache."
             )
         self._current_layer_name: str | None = None
+        self.block_size = self.vllm_config.cache_config.block_size
+
+        try:
+            offload_cfg = get_ascend_config().sparse_kv_offload_config
+            self.use_fused_overlap = bool(getattr(offload_cfg, "use_fused_overlap", False))
+            self.lru_resident_capacity = int(offload_cfg.topk_buffer_size)
+            self.sfa_sparse_topk = int(offload_cfg.topk)
+        except Exception:
+            raw_cfg = (self.vllm_config.additional_config or {}).get("sparse_kv_offload_config", {})
+            self.use_fused_overlap = bool(raw_cfg.get("use_fused_overlap", False))
+            self.lru_resident_capacity = int(raw_cfg.get("topk_buffer_size", 4096))
+            self.sfa_sparse_topk = int(
+                getattr(self.vllm_config.model_config.hf_text_config, "index_topk", 2048)
+            )
+        if self.lru_resident_capacity % self.block_size != 0:
+            raise ValueError(
+                "sparse_kv_offload_config.topk_buffer_size must be divisible by "
+                f"block_size ({self.block_size}); got {self.lru_resident_capacity}"
+            )
+        decode_width = 1
+        if self.vllm_config.speculative_config is not None:
+            decode_width += self.vllm_config.speculative_config.num_speculative_tokens
+        self.max_num_topk_rows = min(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            self.vllm_config.scheduler_config.max_num_seqs * decode_width,
+        )
+        self.selection_kv_block_table: torch.Tensor | None = None
+        self.selection_kv_block_status: torch.Tensor | None = None
+        self.fused_overlap_last_req_ids: torch.Tensor | None = None
+        self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
+        self._fused_overlap_decode_logged = False
+        self._sfa_decode_dump_step_idx = 0
 
     def _resolve_preprocess_type(self, act_dtype: torch.dtype) -> PreprocessType:
         logger.warning_once(
@@ -347,6 +387,542 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         return result
 
+
+    @staticmethod
+    def _ceil_div(value: int, divisor: int) -> int:
+        return (value + divisor - 1) // divisor
+
+    @staticmethod
+    def _flatten_pa_cache(cache: torch.Tensor) -> torch.Tensor:
+        if cache.dim() == 3:
+            return cache
+        if cache.dim() == 4:
+            return cache.reshape(cache.shape[0], cache.shape[1], cache.shape[2] * cache.shape[3])
+        raise RuntimeError(f"PA cache must be 3D or 4D, got shape={tuple(cache.shape)}")
+
+    @staticmethod
+    def _to_int32_device(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        if tensor.dtype == torch.int32 and tensor.device == device:
+            return tensor
+        return tensor.to(device=device, dtype=torch.int32)
+
+    @staticmethod
+    def _get_optional_custom_op(op_name: str):
+        for namespace in (
+            getattr(torch.ops, "_C_ascend", None),
+            getattr(torch.ops, "custom", None),
+            torch_npu,
+        ):
+            if namespace is None:
+                continue
+            op = getattr(namespace, op_name, None)
+            if op is not None:
+                return op
+        return None
+
+    def _require_custom_op(self, op_name: str):
+        op = self._get_optional_custom_op(op_name)
+        if op is None:
+            raise RuntimeError(
+                f"fused_overlap offload requires custom op {op_name}, but it is not registered "
+                "in torch.ops._C_ascend, torch.ops.custom, or torch_npu."
+            )
+        return op
+
+    def _normalize_fused_overlap_topk_indices(
+        self,
+        topk_indices: torch.Tensor,
+        num_tokens: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        topk_indices = self._to_int32_device(topk_indices, device)
+        if topk_indices.dim() == 2:
+            topk_indices = topk_indices.unsqueeze(1)
+        elif topk_indices.dim() == 4:
+            if topk_indices.shape[0] * topk_indices.shape[1] != num_tokens:
+                raise RuntimeError(
+                    "fused_overlap BSND topk token dimension mismatch: "
+                    f"topk_shape={tuple(topk_indices.shape)} num_tokens={num_tokens}"
+                )
+            topk_indices = topk_indices.reshape(num_tokens, topk_indices.shape[2], topk_indices.shape[3])
+        elif topk_indices.dim() != 3:
+            raise RuntimeError(
+                "fused_overlap offload expects topk_indices with dim 2/3/4, "
+                f"got shape={tuple(topk_indices.shape)}"
+            )
+        if topk_indices.shape[0] != num_tokens:
+            raise RuntimeError(
+                "fused_overlap topk token dimension mismatch: "
+                f"topk_shape={tuple(topk_indices.shape)} num_tokens={num_tokens}"
+            )
+        if topk_indices.shape[1] <= 0 or topk_indices.shape[2] <= 0:
+            raise RuntimeError(f"fused_overlap topk shape is invalid: {tuple(topk_indices.shape)}")
+        if self.local_num_heads < topk_indices.shape[1] or self.local_num_heads % topk_indices.shape[1] != 0:
+            raise RuntimeError(
+                "fused_overlap query heads must be a positive multiple of topk heads: "
+                f"query_heads={self.local_num_heads} topk_heads={topk_indices.shape[1]}"
+            )
+        if topk_indices.shape[2] > self.sfa_sparse_topk:
+            raise RuntimeError(
+                "fused_overlap topk exceeds configured topk: "
+                f"topk={topk_indices.shape[2]} configured={self.sfa_sparse_topk}"
+            )
+        return topk_indices.contiguous()
+
+    def _parse_dump_layer_id(self, layer_name: str) -> int | None:
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        if layer_match is None:
+            return None
+        return int(layer_match.group(1))
+
+    def _resolve_decode_dump_location(self, layer_name: str) -> tuple[int, int] | None:
+        if not envs_ascend.VLLM_ASCEND_SFA_DUMP_DIR or get_forward_context().capturing:
+            return None
+        if self.tp_rank != 0:
+            return None
+        layer_id = self._parse_dump_layer_id(layer_name)
+        if layer_id is None or layer_id not in envs_ascend.VLLM_ASCEND_SFA_DUMP_LAYER:
+            return None
+        if self._sfa_decode_dump_step_idx not in envs_ascend.VLLM_ASCEND_SFA_DUMP_STEP:
+            return None
+        return layer_id, 0
+
+    def _maybe_advance_decode_dump_step(self, layer_name: str) -> None:
+        if not envs_ascend.VLLM_ASCEND_SFA_DUMP_DIR or get_forward_context().capturing:
+            return
+        if self.tp_rank != 0:
+            return
+        layer_id = self._parse_dump_layer_id(layer_name)
+        if layer_id is None or layer_id not in envs_ascend.VLLM_ASCEND_SFA_DUMP_LAYER:
+            return
+        self._sfa_decode_dump_step_idx += 1
+
+    def _maybe_dump_first_decode_op_inputs(
+        self,
+        *,
+        layer_name: str,
+        mode: str,
+        op_name: str,
+        inputs: dict[str, Any],
+    ) -> None:
+        dump_location = self._resolve_decode_dump_location(layer_name)
+        if dump_location is None:
+            return
+        layer_id, rank = dump_location
+        step = self._sfa_decode_dump_step_idx
+        output = dump_op_inputs(
+            envs_ascend.VLLM_ASCEND_SFA_DUMP_DIR,
+            mode=mode,
+            layer_name=layer_name,
+            layer_id=layer_id,
+            op_name=op_name,
+            inputs=inputs,
+            rank=rank,
+            pid=os.getpid(),
+            step=step,
+        )
+        logger.warning(
+            "[sfa_decode_dump] saved %s op inputs layer=%s step=%s path=%s",
+            mode,
+            layer_name,
+            step,
+            output,
+        )
+
+    def _maybe_dump_first_decode_op_output(
+        self,
+        *,
+        layer_name: str,
+        mode: str,
+        op_name: str,
+        output: torch.Tensor,
+    ) -> None:
+        dump_location = self._resolve_decode_dump_location(layer_name)
+        if dump_location is not None:
+            layer_id, rank = dump_location
+            step = self._sfa_decode_dump_step_idx
+            output_path = dump_op_output(
+                envs_ascend.VLLM_ASCEND_SFA_DUMP_DIR,
+                mode=mode,
+                layer_name=layer_name,
+                layer_id=layer_id,
+                op_name=op_name,
+                output=output,
+                rank=rank,
+                pid=os.getpid(),
+                step=step,
+            )
+            logger.warning(
+                "[sfa_decode_dump] saved %s op output layer=%s step=%s path=%s",
+                mode,
+                layer_name,
+                step,
+                output_path,
+            )
+        self._maybe_advance_decode_dump_step(layer_name)
+
+    def _flatten_selection_buffer(
+        self,
+        buffer: torch.Tensor,
+        *,
+        row_count: int,
+        blocks_per_row: int,
+        name: str,
+    ) -> torch.Tensor:
+        if buffer.shape[0] < row_count:
+            raise RuntimeError(
+                f"fused_overlap {name} row capacity is too small: "
+                f"required_rows={row_count} buffer_shape={tuple(buffer.shape)}"
+            )
+        view = buffer[:row_count]
+        if view.dim() == 4:
+            if view.shape[1] != self.lru_resident_capacity or view.shape[2] != 1:
+                raise RuntimeError(
+                    f"fused_overlap {name} expects [row, resident_capacity, 1, dim], "
+                    f"got shape={tuple(view.shape)}"
+                )
+            return view.reshape(row_count * blocks_per_row, self.block_size, view.shape[3])
+        if view.dim() == 3:
+            if view.shape[1] != self.lru_resident_capacity:
+                raise RuntimeError(
+                    f"fused_overlap {name} expects resident_capacity in dim1, got shape={tuple(view.shape)}"
+                )
+            return view.reshape(row_count * blocks_per_row, self.block_size, view.shape[2])
+        raise RuntimeError(f"fused_overlap {name} must be 3D or 4D, got shape={tuple(view.shape)}")
+
+    def _ensure_fused_overlap_selection_state(
+        self,
+        *,
+        token_count: int,
+        topk_head_count: int,
+        topk: int,
+        cache_blocks_per_row: int,
+        runtime_blocks_per_row: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache_token_capacity = max(self.max_num_topk_rows, token_count)
+        cache_topk_head_capacity = max(topk_head_count, 1)
+        cache_topk_capacity = max(self.sfa_sparse_topk, topk)
+        row_capacity = cache_token_capacity * cache_topk_head_capacity
+        selection_block_count = row_capacity * cache_blocks_per_row
+        capacity = (
+            cache_token_capacity,
+            cache_topk_head_capacity,
+            cache_topk_capacity,
+            cache_blocks_per_row,
+        )
+        needs_realloc = (
+            self.selection_kv_block_table is None
+            or self.selection_kv_block_status is None
+            or self.fused_overlap_last_req_ids is None
+            or self._fused_overlap_selection_capacity is None
+            or self._fused_overlap_selection_capacity[0] < cache_token_capacity
+            or self._fused_overlap_selection_capacity[1] < cache_topk_head_capacity
+            or self._fused_overlap_selection_capacity[2] < cache_topk_capacity
+            or self._fused_overlap_selection_capacity[3] < cache_blocks_per_row
+            or self.selection_kv_block_table.device != device
+            or self.selection_kv_block_status.device != device
+            or self.fused_overlap_last_req_ids.device != device
+        )
+        if needs_realloc:
+            self.selection_kv_block_table = torch.arange(
+                selection_block_count,
+                dtype=torch.int32,
+                device=device,
+            ).view(row_capacity, cache_blocks_per_row)
+            self.selection_kv_block_status = torch.full(
+                (cache_token_capacity, cache_topk_head_capacity, cache_topk_capacity + 1),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.fused_overlap_last_req_ids = torch.full(
+                (cache_token_capacity,),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
+            self._fused_overlap_selection_capacity = capacity
+            logger.info(
+                "[fused_overlap_offload][selection] allocate token_capacity=%s "
+                "topk_heads=%s topk=%s blocks_per_row=%s",
+                cache_token_capacity,
+                cache_topk_head_capacity,
+                cache_topk_capacity,
+                cache_blocks_per_row,
+            )
+        assert self.selection_kv_block_table is not None
+        assert self.selection_kv_block_status is not None
+        assert self.fused_overlap_last_req_ids is not None
+        return (
+            self.selection_kv_block_table[: token_count * topk_head_count, :runtime_blocks_per_row],
+            self.selection_kv_block_status[:token_count, :topk_head_count, : topk + 1],
+            self.fused_overlap_last_req_ids[:token_count],
+        )
+
+    def _invalidate_fused_overlap_selection_rows(
+        self,
+        selection_kv_block_status: torch.Tensor,
+        last_req_ids: torch.Tensor,
+        attn_metadata: M,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+    ) -> None:
+        if attn_metadata.token_to_req is None:
+            raise RuntimeError(
+                "fused_overlap offload requires token_to_req metadata for selection invalidation"
+            )
+        if attn_metadata.req_ids_tensor is None:
+            raise RuntimeError(
+                "fused_overlap offload requires req_ids_tensor metadata for selection invalidation"
+            )
+        token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=last_req_ids.device, dtype=torch.long)
+        if not get_forward_context().capturing:
+            invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
+            if bool(invalid_req_mapping.any().item()):
+                raise RuntimeError(
+                    "fused_overlap token_to_req contains request indices outside decode request range: "
+                    f"num_tokens={num_tokens} num_reqs={num_reqs}"
+                )
+        req_ids = attn_metadata.req_ids_tensor[:num_reqs].to(device=last_req_ids.device, dtype=torch.long)
+        current_req_ids = req_ids[token_to_req]
+        selection_kv_block_status.fill_(-1)
+        last_req_ids.copy_(current_req_ids)
+
+    def _validate_fused_overlap_mtp_decode_metadata(
+        self,
+        attn_metadata: M,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        full_q_actual_seq: torch.Tensor,
+        full_kv_actual_seq: torch.Tensor,
+    ) -> None:
+        if attn_metadata.token_to_req is None:
+            raise RuntimeError(
+                "fused_overlap offload decode requires token_to_req metadata "
+                f"(num_tokens={num_tokens} num_reqs={num_reqs})"
+            )
+        if full_q_actual_seq.numel() != num_reqs:
+            raise RuntimeError(
+                "fused_overlap full_q_actual_seq must have one entry per decode "
+                f"request: got {full_q_actual_seq.numel()} for num_reqs={num_reqs}"
+            )
+        if full_kv_actual_seq.numel() != num_reqs:
+            raise RuntimeError(
+                "fused_overlap full_kv_actual_seq must have one entry per decode "
+                f"request: got {full_kv_actual_seq.numel()} for num_reqs={num_reqs}"
+            )
+        if get_forward_context().capturing:
+            return
+        token_to_req = attn_metadata.token_to_req[:num_tokens]
+        if token_to_req.numel() != num_tokens:
+            raise RuntimeError(
+                "fused_overlap token_to_req length mismatch: "
+                f"got {token_to_req.numel()} for num_tokens={num_tokens}"
+            )
+        invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
+        if bool(invalid_req_mapping.any().item()):
+            raise RuntimeError(
+                "fused_overlap token_to_req contains request indices outside "
+                f"decode request range: num_tokens={num_tokens} num_reqs={num_reqs}"
+            )
+        q_cum_last = int(full_q_actual_seq[-1].item())
+        if q_cum_last != num_tokens:
+            raise RuntimeError(
+                "fused_overlap TND full_q_actual_seq must end at num_tokens: "
+                f"full_q_actual_seq[-1]={q_cum_last} num_tokens={num_tokens} "
+                f"num_reqs={num_reqs}"
+            )
+
+    def _flatten_fused_overlap_mtp_to_token_batch(
+        self,
+        attn_metadata: M,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        full_q_actual_seq: torch.Tensor,
+        full_kv_actual_seq: torch.Tensor,
+        full_kv_block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert attn_metadata.token_to_req is not None
+        device = full_q_actual_seq.device
+        token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=device, dtype=torch.long)
+        req_cum_q = full_q_actual_seq.to(device=device, dtype=torch.long)
+        req_seq_lens = full_kv_actual_seq.to(device=device, dtype=torch.long)
+        req_q_lens = torch.diff(req_cum_q, prepend=req_cum_q.new_zeros(1))
+        token_starts = torch.zeros(num_reqs, dtype=torch.long, device=device)
+        if num_reqs > 1:
+            token_starts[1:] = req_cum_q[:-1]
+        local_offsets = torch.arange(num_tokens, device=device, dtype=torch.long) - token_starts[token_to_req]
+        token_kv_lens = (
+            req_seq_lens[token_to_req] - req_q_lens[token_to_req] + local_offsets + 1
+        ).to(dtype=torch.int32).contiguous()
+        if not get_forward_context().capturing and bool((token_kv_lens <= 0).any().item()):
+            raise RuntimeError(
+                "fused_overlap MTP flatten produced non-positive per-token kv lenses: "
+                f"token_kv_lens={token_kv_lens.detach().cpu().tolist()}"
+            )
+        token_q_cum = torch.arange(1, num_tokens + 1, device=device, dtype=torch.int32).contiguous()
+        token_block_table = full_kv_block_table[token_to_req].contiguous()
+        return token_q_cum, token_kv_lens, token_block_table
+
+    def _execute_fused_overlap_offload_decode(
+        self,
+        ql_nope_decode: torch.Tensor,
+        q_pe_decode: torch.Tensor,
+        topk_indices_decode: torch.Tensor,
+        attn_metadata: M,
+        actual_seq_lengths_query_decode: torch.Tensor,
+        actual_seq_lengths_key_decode: torch.Tensor,
+        layer_name: str,
+    ) -> torch.Tensor:
+        num_tokens = ql_nope_decode.shape[0]
+        num_reqs = int(getattr(attn_metadata, "num_decodes", 0) or 0)
+        if num_tokens <= 0 or num_reqs <= 0:
+            raise RuntimeError(
+                "fused_overlap decode requires positive num_tokens and num_reqs: "
+                f"num_tokens={num_tokens} num_reqs={num_reqs}"
+            )
+
+        manager = get_sparse_kv_offload_manager()
+        fused_op = self._require_custom_op("npu_fused_sparse_attention_overlap")
+        topk_indices_decode = self._normalize_fused_overlap_topk_indices(
+            topk_indices_decode,
+            num_tokens,
+            ql_nope_decode.device,
+        )
+        topk_head_count = topk_indices_decode.shape[1]
+        topk = topk_indices_decode.shape[2]
+        runtime_blocks_per_row = max(self._ceil_div(topk, self.block_size), 1)
+        cache_blocks_per_row = self.lru_resident_capacity // self.block_size
+        if runtime_blocks_per_row > cache_blocks_per_row:
+            raise RuntimeError(
+                "fused_overlap topk exceeds selection buffer capacity: "
+                f"topk={topk} runtime_blocks_per_row={runtime_blocks_per_row} "
+                f"resident_capacity={self.lru_resident_capacity} block_size={self.block_size}"
+            )
+
+        full_kv_cache_cpu, full_k_rope_cpu = manager.get_fused_overlap_cpu_kv_inputs(layer_name)
+        full_kv_cache = self._flatten_pa_cache(full_kv_cache_cpu)
+        full_k_rope = self._flatten_pa_cache(full_k_rope_cpu)
+        full_kv_block_table = self._to_int32_device(
+            attn_metadata.block_table[:num_reqs],
+            ql_nope_decode.device,
+        )
+        full_kv_actual_seq = self._to_int32_device(actual_seq_lengths_key_decode, ql_nope_decode.device)
+        full_q_actual_seq = self._to_int32_device(actual_seq_lengths_query_decode, ql_nope_decode.device)
+        self._validate_fused_overlap_mtp_decode_metadata(
+            attn_metadata,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            full_q_actual_seq=full_q_actual_seq,
+            full_kv_actual_seq=full_kv_actual_seq,
+        )
+        if num_tokens != num_reqs:
+            full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = (
+                self._flatten_fused_overlap_mtp_to_token_batch(
+                    attn_metadata,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    full_q_actual_seq=full_q_actual_seq,
+                    full_kv_actual_seq=full_kv_actual_seq,
+                    full_kv_block_table=full_kv_block_table,
+                )
+            )
+        elif full_q_actual_seq.numel() != full_kv_actual_seq.numel():
+            raise RuntimeError(
+                "fused_overlap Q/KV actual_seq batch mismatch: "
+                f"full_q_actual_seq.numel()={full_q_actual_seq.numel()} "
+                f"full_kv_actual_seq.numel()={full_kv_actual_seq.numel()} "
+                f"num_tokens={num_tokens} num_reqs={num_reqs}"
+            )
+
+        layer_id = manager._get_offload_layer_id(layer_name)
+        row_count = num_tokens * topk_head_count
+        selection_kv_cache = self._flatten_selection_buffer(
+            manager.topk_buffers_k[layer_id],
+            row_count=row_count,
+            blocks_per_row=cache_blocks_per_row,
+            name="selection_kv_cache",
+        )
+        selection_k_rope = self._flatten_selection_buffer(
+            manager.topk_buffers_v[layer_id],
+            row_count=row_count,
+            blocks_per_row=cache_blocks_per_row,
+            name="selection_k_rope",
+        )
+        selection_block_table, selection_block_status, last_req_ids = self._ensure_fused_overlap_selection_state(
+            token_count=num_tokens,
+            topk_head_count=topk_head_count,
+            topk=topk,
+            cache_blocks_per_row=cache_blocks_per_row,
+            runtime_blocks_per_row=runtime_blocks_per_row,
+            device=ql_nope_decode.device,
+        )
+        self._invalidate_fused_overlap_selection_rows(
+            selection_block_status,
+            last_req_ids,
+            attn_metadata,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+        )
+
+        if not self._fused_overlap_decode_logged:
+            logger.info(
+                "[fused_overlap_offload][decode] layer=%s num_tokens=%s num_reqs=%s "
+                "query_shape=%s q_rope_shape=%s topk_shape=%s selection_kv_shape=%s "
+                "selection_rope_shape=%s full_kv_shape=%s full_rope_shape=%s",
+                layer_name,
+                num_tokens,
+                num_reqs,
+                tuple(ql_nope_decode.shape),
+                tuple(q_pe_decode.shape),
+                tuple(topk_indices_decode.shape),
+                tuple(selection_kv_cache.shape),
+                tuple(selection_k_rope.shape),
+                tuple(full_kv_cache.shape),
+                tuple(full_k_rope.shape),
+            )
+            self._fused_overlap_decode_logged = True
+
+        fused_query = torch.cat([ql_nope_decode, q_pe_decode], dim=-1).contiguous()
+        fused_inputs = {
+            "query": fused_query,
+            "selection_k_rope": selection_k_rope,
+            "selection_kv_cache": selection_kv_cache,
+            "selection_kv_block_table": selection_block_table,
+            "selection_kv_block_status": selection_block_status,
+            "selection_topk_indices": topk_indices_decode,
+            "full_k_rope": full_k_rope,
+            "full_kv_cache": full_kv_cache,
+            "full_kv_block_table": full_kv_block_table,
+            "full_kv_actual_seq": full_kv_actual_seq,
+            "full_q_actual_seq": full_q_actual_seq,
+            "scale_value": self.scale,
+            "sparse_block_size": 1,
+            "selection_topk_block_size": 1,
+            "layout_query": "TND",
+            "layout_kv": "PA_BSND",
+            "sparse_mode": 3,
+        }
+        self._maybe_dump_first_decode_op_inputs(
+            layer_name=layer_name,
+            mode="fused",
+            op_name="npu_fused_sparse_attention_overlap",
+            inputs=fused_inputs,
+        )
+        attn_output = fused_op(**fused_inputs)
+        attn_output = attn_output[..., : ql_nope_decode.shape[-1]].contiguous()
+        self._maybe_dump_first_decode_op_output(
+            layer_name=layer_name,
+            mode="fused",
+            op_name="npu_fused_sparse_attention_overlap",
+            output=attn_output,
+        )
+        return attn_output
+
     def _execute_sparse_flash_attention_process(
         self,
         ql_nope,
@@ -378,6 +954,36 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
 
         if attn_metadata.req_ids_tensor is None or attn_metadata.token_to_req is None:
             raise RuntimeError("Sparse KV offload requires req_ids_tensor/token_to_req metadata")
+
+        if self.use_fused_overlap:
+            decode_attn_output = self._execute_fused_overlap_offload_decode(
+                ql_nope[:num_decode_tokens],
+                q_pe[:num_decode_tokens],
+                topk_indices[:num_decode_tokens],
+                attn_metadata,
+                actual_seq_lengths_query[:num_decodes],
+                actual_seq_lengths_key[:num_decodes],
+                layer_name,
+            )
+            if num_prefills == 0:
+                return self._pad_to_input_tokens(decode_attn_output, ql_nope.shape[0])
+            _check_device_kv_cache_exist()
+            prefill_query_offset = actual_seq_lengths_query[num_decodes - 1]
+            prefill_query_lens = actual_seq_lengths_query[num_decodes:] - prefill_query_offset
+            prefill_block_table = attn_metadata.block_table[num_decodes : num_decodes + num_prefills]
+            prefill_attn_output = super()._execute_sparse_flash_attention_process(
+                ql_nope[num_decode_tokens:],
+                q_pe[num_decode_tokens:],
+                kv_cache,
+                topk_indices[num_decode_tokens:],
+                attn_metadata,
+                prefill_query_lens,
+                actual_seq_lengths_key[num_decodes:],
+                block_table=prefill_block_table,
+            )
+            attn_output = torch.cat([decode_attn_output, prefill_attn_output], dim=0)
+            return self._pad_to_input_tokens(attn_output, ql_nope.shape[0])
+
         token_to_req = attn_metadata.token_to_req[:num_decode_tokens]
         row_to_req = token_to_req.to(dtype=torch.int64)
         decode_seq_lens = torch.index_select(

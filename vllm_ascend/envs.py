@@ -22,6 +22,21 @@ import os
 from collections.abc import Callable
 from typing import Any
 
+
+def _parse_int_set(env_name: str, default: str = "0") -> frozenset[int]:
+    """Parse a comma-separated integer list env var into a frozenset."""
+    raw = os.getenv(env_name, default)
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        values.add(int(part))
+    if not values:
+        values.add(0)
+    return frozenset(values)
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -107,6 +122,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable non-sensitive SFA PD transfer diagnostics. 0 disables verbose
     # per-request/per-layer logs (default); 1 enables them.
     "VLLM_ASCEND_SFA_DEBUG": lambda: bool(int(os.getenv("VLLM_ASCEND_SFA_DEBUG", "0"))),
+    # Dump eager decode operator inputs/outputs for the selected layer/step.
+    # Only TP rank 0 writes dumps. Empty (default) disables dump I/O.
+    "VLLM_ASCEND_SFA_DUMP_DIR": lambda: os.getenv("VLLM_ASCEND_SFA_DUMP_DIR", ""),
+    # Zero-based layer indices selected by VLLM_ASCEND_SFA_DUMP_DIR.
+    "VLLM_ASCEND_SFA_DUMP_LAYER": lambda: _parse_int_set("VLLM_ASCEND_SFA_DUMP_LAYER", "0"),
+    # Zero-based decode-step indices to dump on the selected layers.
+    "VLLM_ASCEND_SFA_DUMP_STEP": lambda: _parse_int_set("VLLM_ASCEND_SFA_DUMP_STEP", "0"),
     # Enable non-sensitive MemFabric KV checksum verification. 0 disables it
     # (default); 1 enables it and incurs device-to-host synchronization.
     "VLLM_ASCEND_MF_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_MF_VERIFY", "0"))),
