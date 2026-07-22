@@ -793,6 +793,34 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_tokens,
             ql_nope_decode.device,
         )
+        # Match legacy onload: drop indexer padding (-1) and unwritten
+        # tail-block indices (>= seq_len) before the fused op reads CPU KV.
+        if attn_metadata.token_to_req is None:
+            raise RuntimeError(
+                "fused_overlap offload requires token_to_req metadata for topk masking"
+            )
+        token_to_req = attn_metadata.token_to_req[:num_tokens].to(
+            device=topk_indices_decode.device,
+            dtype=torch.long,
+        )
+        decode_seq_lens = torch.index_select(
+            actual_seq_lengths_key_decode[:num_reqs].to(
+                device=topk_indices_decode.device,
+                dtype=topk_indices_decode.dtype,
+            ),
+            0,
+            token_to_req,
+        )
+        seq_len_thresholds = decode_seq_lens.view(
+            num_tokens,
+            *([1] * (topk_indices_decode.ndim - 1)),
+        )
+        valid_topk = build_valid_topk_mask(topk_indices_decode, seq_len_thresholds)
+        topk_indices_decode = torch.where(
+            valid_topk,
+            topk_indices_decode,
+            torch.full_like(topk_indices_decode, -1),
+        )
         topk_head_count = topk_indices_decode.shape[1]
         topk = topk_indices_decode.shape[2]
         runtime_blocks_per_row = max(self._ceil_div(topk, self.block_size), 1)
@@ -805,12 +833,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
 
         full_kv_cache_cpu, full_k_rope_cpu = manager.get_fused_overlap_cpu_kv_inputs(layer_name)
-        full_kv_cache = self._flatten_pa_cache(full_kv_cache_cpu)
-        full_k_rope = self._flatten_pa_cache(full_k_rope_cpu)
+        full_kv_cache = self._flatten_pa_cache(full_kv_cache_cpu).contiguous()
+        full_k_rope = self._flatten_pa_cache(full_k_rope_cpu).contiguous()
         full_kv_block_table = self._to_int32_device(
             attn_metadata.block_table[:num_reqs],
             ql_nope_decode.device,
-        )
+        ).contiguous()
         full_kv_actual_seq = self._to_int32_device(actual_seq_lengths_key_decode, ql_nope_decode.device)
         full_q_actual_seq = self._to_int32_device(actual_seq_lengths_query_decode, ql_nope_decode.device)
         self._validate_fused_overlap_mtp_decode_metadata(
