@@ -214,6 +214,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
         self._sfa_decode_dump_step_idx = 0
+        # Cumulative selection hit stats for VLLM_ASCEND_SFA_DEBUG (eager only).
+        self._fused_overlap_hit_total_hits = 0
+        self._fused_overlap_hit_total_valid = 0
+        self._fused_overlap_hit_num_steps = 0
 
     def _resolve_preprocess_type(self, act_dtype: torch.dtype) -> PreprocessType:
         logger.warning_once(
@@ -726,6 +730,62 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 int(oob_hits.sum().item()),
             )
 
+    def _maybe_log_fused_overlap_selection_hit_ratio(
+        self,
+        *,
+        layer_name: str,
+        selection_kv_block_status: torch.Tensor,
+        selection_topk_indices: torch.Tensor,
+    ) -> None:
+        """Log expected selection hit ratio after invalidate (eager + debug only).
+
+        A topk entry is counted as hit if its absolute token id already exists in
+        that row's ``selection_kv_block_status[..., :-1]``. This matches the
+        kernel's status-lookup precondition; it is not a kernel-internal counter.
+        """
+        if not envs_ascend.VLLM_ASCEND_SFA_DEBUG or get_forward_context().capturing:
+            return
+        topk_status = selection_kv_block_status[..., :-1]
+        topk = selection_topk_indices
+        if topk.shape[:2] != topk_status.shape[:2] or topk.shape[-1] > topk_status.shape[-1]:
+            logger.warning(
+                "[fused_overlap_offload][selection][hit] skip layer=%s "
+                "shape mismatch topk=%s status=%s",
+                layer_name,
+                tuple(topk.shape),
+                tuple(topk_status.shape),
+            )
+            return
+        valid = topk >= 0
+        # [T, H, K, 1] == [T, H, 1, S] -> any over cached status slots.
+        hits = (topk.unsqueeze(-1) == topk_status.unsqueeze(-2)).any(dim=-1) & valid
+        valid_count = int(valid.sum().item())
+        hit_count = int(hits.sum().item())
+        miss_count = valid_count - hit_count
+        hit_ratio = (hit_count / valid_count) if valid_count > 0 else 0.0
+        self._fused_overlap_hit_total_hits += hit_count
+        self._fused_overlap_hit_total_valid += valid_count
+        self._fused_overlap_hit_num_steps += 1
+        avg_hit_ratio = (
+            self._fused_overlap_hit_total_hits / self._fused_overlap_hit_total_valid
+            if self._fused_overlap_hit_total_valid > 0
+            else 0.0
+        )
+        logger.info(
+            "[fused_overlap_offload][selection][hit] layer=%s "
+            "valid_topk=%s hit=%s miss=%s hit_ratio=%.4f avg_hit_ratio=%.4f "
+            "(steps=%s total_valid=%s total_hit=%s)",
+            layer_name,
+            valid_count,
+            hit_count,
+            miss_count,
+            hit_ratio,
+            avg_hit_ratio,
+            self._fused_overlap_hit_num_steps,
+            self._fused_overlap_hit_total_valid,
+            self._fused_overlap_hit_total_hits,
+        )
+
     def _validate_fused_overlap_mtp_decode_metadata(
         self,
         attn_metadata: M,
@@ -957,6 +1017,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_reqs=num_reqs,
             seq_lens=actual_seq_lengths_key_decode,
             cum_query_lens=actual_seq_lengths_query_decode,
+        )
+        self._maybe_log_fused_overlap_selection_hit_ratio(
+            layer_name=layer_name,
+            selection_kv_block_status=selection_block_status,
+            selection_topk_indices=topk_indices_decode,
         )
 
         if not self._fused_overlap_decode_logged:
