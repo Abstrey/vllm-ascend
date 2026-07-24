@@ -668,6 +668,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         *,
         num_tokens: int,
         num_reqs: int,
+        seq_lens: torch.Tensor,
+        cum_query_lens: torch.Tensor,
     ) -> None:
         if attn_metadata.token_to_req is None:
             raise RuntimeError(
@@ -677,7 +679,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             raise RuntimeError(
                 "fused_overlap offload requires req_ids_tensor metadata for selection invalidation"
             )
-        token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=last_req_ids.device, dtype=torch.long)
+        device = last_req_ids.device
+        token_to_req = attn_metadata.token_to_req[:num_tokens].to(device=device, dtype=torch.long)
         if not get_forward_context().capturing:
             invalid_req_mapping = (token_to_req < 0) | (token_to_req >= num_reqs)
             if bool(invalid_req_mapping.any().item()):
@@ -685,10 +688,43 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     "fused_overlap token_to_req contains request indices outside decode request range: "
                     f"num_tokens={num_tokens} num_reqs={num_reqs}"
                 )
-        req_ids = attn_metadata.req_ids_tensor[:num_reqs].to(device=last_req_ids.device, dtype=torch.long)
+        req_ids = attn_metadata.req_ids_tensor[:num_reqs].to(device=device, dtype=torch.long)
         current_req_ids = req_ids[token_to_req]
-        selection_kv_block_status.fill_(-1)
+        # Row reuse by a different request: drop the whole selection status row.
+        changed_rows = last_req_ids != current_req_ids
+        selection_kv_block_status.masked_fill_(changed_rows.view(num_tokens, 1, 1), -1)
         last_req_ids.copy_(current_req_ids)
+
+        # Selection status stores absolute topk token indices. History hits can
+        # still be reused under MTP; clear entries that:
+        # 1) fall in this step's rewritten window [seq_len - q_len, seq_len)
+        #    (newly written / spec-reject rewritable tokens), or
+        # 2) are out of range for the current seq_len (>= seq_len).
+        # The trailing status slot is actual_seq metadata, not a topk index.
+        seq_lens = seq_lens[:num_reqs].to(device=device, dtype=torch.long)
+        cum_query_lens = cum_query_lens[:num_reqs].to(device=device, dtype=torch.long)
+        query_lens = torch.diff(cum_query_lens, prepend=cum_query_lens.new_zeros(1))
+        rewrite_start = (seq_lens - query_lens)[token_to_req].view(num_tokens, 1, 1)
+        rewrite_end = seq_lens[token_to_req].view(num_tokens, 1, 1)
+        topk_status = selection_kv_block_status[..., :-1]
+        rewritten_hits = (
+            (topk_status >= 0)
+            & (topk_status >= rewrite_start)
+            & (topk_status < rewrite_end)
+        )
+        oob_hits = (topk_status >= 0) & (topk_status >= rewrite_end)
+        topk_status.masked_fill_(rewritten_hits | oob_hits, -1)
+
+        if envs_ascend.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
+            logger.info(
+                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s "
+                "changed_rows=%s rewritten_topk_hits=%s oob_topk_hits=%s",
+                num_tokens,
+                num_reqs,
+                int(changed_rows.sum().item()),
+                int(rewritten_hits.sum().item()),
+                int(oob_hits.sum().item()),
+            )
 
     def _validate_fused_overlap_mtp_decode_metadata(
         self,
@@ -919,6 +955,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             attn_metadata,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
+            seq_lens=actual_seq_lengths_key_decode,
+            cum_query_lens=actual_seq_lengths_query_decode,
         )
 
         if not self._fused_overlap_decode_logged:
