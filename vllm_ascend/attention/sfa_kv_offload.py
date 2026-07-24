@@ -848,7 +848,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             full_q_actual_seq=full_q_actual_seq,
             full_kv_actual_seq=full_kv_actual_seq,
         )
-        if num_tokens != num_reqs:
+        if num_tokens != num_reqs and envs_ascend.VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN:
             full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = (
                 self._flatten_fused_overlap_mtp_to_token_batch(
                     attn_metadata,
@@ -859,6 +859,30 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                     full_kv_block_table=full_kv_block_table,
                 )
             )
+        elif num_tokens != num_reqs:
+            if not getattr(self, "_fused_overlap_mtp_no_flatten_logged", False):
+                logger.warning(
+                    "[fused_overlap_offload] MTP flatten disabled "
+                    "(VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN=0); keeping native TND "
+                    "actual_seq/block_table with num_tokens=%s num_reqs=%s",
+                    num_tokens,
+                    num_reqs,
+                )
+                self._fused_overlap_mtp_no_flatten_logged = True
+            if full_q_actual_seq.numel() != full_kv_actual_seq.numel():
+                raise RuntimeError(
+                    "fused_overlap native-TND Q/KV actual_seq batch mismatch: "
+                    f"full_q_actual_seq.numel()={full_q_actual_seq.numel()} "
+                    f"full_kv_actual_seq.numel()={full_kv_actual_seq.numel()} "
+                    f"num_tokens={num_tokens} num_reqs={num_reqs}"
+                )
+            if full_kv_block_table.size(0) != full_q_actual_seq.numel():
+                raise RuntimeError(
+                    "fused_overlap native-TND block_table batch mismatch: "
+                    f"block_table.size(0)={full_kv_block_table.size(0)} "
+                    f"full_q_actual_seq.numel()={full_q_actual_seq.numel()} "
+                    f"num_tokens={num_tokens} num_reqs={num_reqs}"
+                )
         elif full_q_actual_seq.numel() != full_kv_actual_seq.numel():
             raise RuntimeError(
                 "fused_overlap Q/KV actual_seq batch mismatch: "

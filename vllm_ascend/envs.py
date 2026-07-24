@@ -129,6 +129,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_SFA_DUMP_LAYER": lambda: _parse_int_set("VLLM_ASCEND_SFA_DUMP_LAYER", "0"),
     # Zero-based decode-step indices to dump on the selected layers.
     "VLLM_ASCEND_SFA_DUMP_STEP": lambda: _parse_int_set("VLLM_ASCEND_SFA_DUMP_STEP", "0"),
+    # fused_overlap MTP: when num_tokens != num_reqs, expand Q/KV actual_seq and
+    # block_table to a token-batch (actS1=1). Default 1 keeps current behavior.
+    # Set 0 to keep native TND (cum_q length = num_reqs) for A/B debugging.
+    "VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN", "1"))
+    ),
     # Enable non-sensitive MemFabric KV checksum verification. 0 disables it
     # (default); 1 enables it and incurs device-to-host synchronization.
     "VLLM_ASCEND_MF_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_MF_VERIFY", "0"))),
