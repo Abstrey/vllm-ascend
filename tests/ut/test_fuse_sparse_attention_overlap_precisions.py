@@ -317,7 +317,7 @@ def _call_fused(inp):
     )
 
 
-def _bench_fused(inp, warmup: int, iters: int) -> float:
+def _bench_fused_eager(inp, warmup: int, iters: int) -> float:
     for _ in range(warmup):
         _ = _call_fused(inp)
     torch.npu.synchronize()
@@ -332,6 +332,49 @@ def _bench_fused(inp, warmup: int, iters: int) -> float:
     return start.elapsed_time(end) / iters
 
 
+def _bench_fused_graph(inp, warmup: int, iters: int) -> float:
+    """Capture fused op into ACL graph and time ``graph.replay()``."""
+    if not hasattr(torch.npu, "NPUGraph"):
+        raise RuntimeError("torch.npu.NPUGraph is unavailable on this torch_npu build")
+
+    # Eager warmup first (compile / cache / selection status settle).
+    for _ in range(max(1, warmup)):
+        _ = _call_fused(inp)
+    torch.npu.synchronize()
+
+    graph = torch.npu.NPUGraph()
+    print("GRAPH_CAPTURE begin", flush=True)
+    try:
+        with torch.npu.graph(
+            graph,
+            capture_error_mode="thread_local",
+            auto_dispatch_capture=True,
+        ):
+            out = _call_fused(inp)
+    except TypeError:
+        # Older torch_npu may not accept auto_dispatch_capture.
+        with torch.npu.graph(graph, capture_error_mode="thread_local"):
+            out = _call_fused(inp)
+    torch.npu.synchronize()
+    print(
+        "GRAPH_CAPTURE done out_shape={}".format(tuple(out.shape)),
+        flush=True,
+    )
+
+    for _ in range(warmup):
+        graph.replay()
+    torch.npu.synchronize()
+
+    start = torch.npu.Event(enable_timing=True)
+    end = torch.npu.Event(enable_timing=True)
+    start.record()
+    for _ in range(iters):
+        graph.replay()
+    end.record()
+    torch.npu.synchronize()
+    return start.elapsed_time(end) / iters
+
+
 def run_case(
     topk: int,
     q_heads: int,
@@ -339,27 +382,33 @@ def run_case(
     warmup: int,
     iters: int,
     cpu_kv_backend: CpuKvBackend = "offload",
+    use_graph: bool = False,
 ) -> float:
     inp = _build_inputs(topk, q_heads, host_kv=host_kv)
+    mode = "graph" if use_graph else "eager"
     print(
         "CASE topk={} q_heads={} kv_heads={} max_seq_len={} num_blocks={} "
-        "cpu_kv_backend={} q_shape={} topk_shape={}".format(
+        "cpu_kv_backend={} mode={} q_shape={} topk_shape={}".format(
             topk,
             q_heads,
             inp["kv_heads"],
             inp["msl"],
             inp["num_blocks"],
             cpu_kv_backend,
+            mode,
             tuple(inp["q_fused"].shape),
             tuple(inp["topk_fused"].shape),
         ),
         flush=True,
     )
 
-    avg_ms = _bench_fused(inp, warmup=warmup, iters=iters)
+    if use_graph:
+        avg_ms = _bench_fused_graph(inp, warmup=warmup, iters=iters)
+    else:
+        avg_ms = _bench_fused_eager(inp, warmup=warmup, iters=iters)
     print(
-        "BENCH topk={} q_heads={} max_seq_len={} warmup={} iters={} avg_ms={:.3f}".format(
-            topk, q_heads, inp["msl"], warmup, iters, avg_ms
+        "BENCH mode={} topk={} q_heads={} max_seq_len={} warmup={} iters={} avg_ms={:.3f}".format(
+            mode, topk, q_heads, inp["msl"], warmup, iters, avg_ms
         ),
         flush=True,
     )
@@ -404,6 +453,12 @@ def parse_args():
         "(same as kv_offload_decode_config.dram_size_per_dp_GB). "
         "Default: auto from --max-seq-len (1M -> ~2GiB).",
     )
+    parser.add_argument(
+        "--use-graph",
+        action="store_true",
+        help="Capture fused op into torch.npu.NPUGraph and time graph.replay() "
+        "(ACL graph / aclgraph path). Default is eager launch timing.",
+    )
     # Backward-compatible: bare `script.py 64,1024` still works.
     parser.add_argument("legacy_topk", nargs="?", default=None)
     return parser.parse_args()
@@ -433,10 +488,11 @@ def main():
             "cpu-kv-backend=swap_memory but torch_npu.empty_with_swapped_memory is unavailable"
         )
 
+    mode = "graph" if args.use_graph else "eager"
     print(
         f"{cases=} {q_heads_list=} max_seq_len={plan_msl} "
         f"num_blocks={cdiv(plan_msl, _BLOCK_SIZE)} "
-        f"warmup={args.warmup} iters={args.iters} "
+        f"warmup={args.warmup} iters={args.iters} mode={mode} "
         f"cpu_kv_backend={cpu_kv_backend} dram_size_gb={dram_size_gb} "
         f"cpu_kv_est_gib={need_bytes / _GIB:.3f}",
         flush=True,
@@ -459,8 +515,9 @@ def main():
                         warmup=args.warmup,
                         iters=args.iters,
                         cpu_kv_backend=cpu_kv_backend,
+                        use_graph=args.use_graph,
                     )
-                    results.append((topk, q_heads, avg_ms))
+                    results.append((topk, q_heads, mode, avg_ms))
             finally:
                 del host_kv
                 gc.collect()
@@ -472,9 +529,11 @@ def main():
                 print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
 
     print("----- TIMING SUMMARY -----", flush=True)
-    for topk, q_heads, avg_ms in results:
+    for topk, q_heads, bench_mode, avg_ms in results:
         print(
-            "topk={} q_heads={} avg_ms={:.3f}".format(topk, q_heads, avg_ms),
+            "mode={} topk={} q_heads={} avg_ms={:.3f}".format(
+                bench_mode, topk, q_heads, avg_ms
+            ),
             flush=True,
         )
 
