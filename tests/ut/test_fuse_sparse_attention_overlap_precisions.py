@@ -1,4 +1,5 @@
 import argparse
+import gc
 import math
 from typing import Literal
 
@@ -46,11 +47,37 @@ def _empty_aligned_cpu_tensor(
     dtype: torch.dtype,
     alignment: int = _CPU_CACHE_ALIGNMENT,
 ) -> torch.Tensor:
-    """Same allocation path as KVOffloadDecodeManager._empty_aligned_cpu_tensor."""
+    """Same allocation path as KVOffloadDecodeManager / model_runner CPU KV.
+
+    Allocate raw int8 bytes from MemFabric, align, then view as ``dtype``.
+    Avoids ``offload.empty(..., bfloat16)`` which some MemFabric builds reject,
+    and matches production ``int8`` pool then ``.view(dtype).view(shape)``.
+    """
     num_elements = int(np.prod(shape))
-    extra_elements = cdiv(alignment, torch.empty((), dtype=dtype).element_size())
-    tensor = offload.empty([num_elements + extra_elements], dtype=dtype, pin_memory=True)
-    return _align_memory(tensor, alignment)[:num_elements].view(shape)
+    nbytes = num_elements * torch.empty((), dtype=dtype).element_size()
+    extra_bytes = alignment
+    print(
+        "OFFLOAD_EMPTY shape={} dtype={} nbytes={:.3f} GiB (+align {:.3f} MiB)".format(
+            shape, dtype, nbytes / _GIB, extra_bytes / (1024 * 1024)
+        ),
+        flush=True,
+    )
+    try:
+        raw = offload.empty([nbytes + extra_bytes], dtype=torch.int8, pin_memory=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"offload.empty failed for {(nbytes + extra_bytes) / _GIB:.3f} GiB "
+            f"(shape={shape}, dtype={dtype}): {type(exc).__name__}: {exc}. "
+            "Check MemFabric pool size (--dram-size-gb) and host free/locked memory; "
+            "avoid a second full host copy via torch.randn."
+        ) from exc
+    aligned = _align_memory(raw, alignment)[:nbytes]
+    return aligned.view(dtype).view(shape)
+
+
+def _fill_host_kv_inplace(tensor: torch.Tensor) -> None:
+    """Fill host KV without a second full-size host malloc (timing UT only)."""
+    tensor.zero_()
 
 
 def init_offload_pool(
@@ -70,7 +97,14 @@ def init_offload_pool(
         ),
         flush=True,
     )
-    offload.initialize(config)
+    try:
+        offload.initialize(config)
+    except Exception as exc:
+        raise RuntimeError(
+            f"offload.initialize failed for {dram_size_gb} GiB pool: "
+            f"{type(exc).__name__}: {exc}. Host may lack free/locked memory for "
+            "MemFabric pinned pool; try smaller --dram-size-gb or free host RAM."
+        ) from exc
 
 
 def uninit_offload_pool() -> None:
@@ -89,8 +123,8 @@ def estimate_cpu_kv_bytes(max_seq_len: int, block_size: int = _BLOCK_SIZE) -> in
 
 def recommended_dram_size_gb(max_seq_len: int, block_size: int = _BLOCK_SIZE) -> float:
     need_bytes = estimate_cpu_kv_bytes(max_seq_len, block_size)
-    # Round up to next 0.5 GiB with a small headroom.
-    return math.ceil((need_bytes / _GIB) * 2) / 2.0 + 0.5
+    # One host KV copy + ~1GiB MemFabric headroom; round up to 0.5 GiB.
+    return math.ceil((need_bytes / _GIB + 1.0) * 2) / 2.0
 
 
 def _alloc_cpu_kv_tensor(
@@ -102,6 +136,10 @@ def _alloc_cpu_kv_tensor(
 
     - offload: MemFabric ``offload.empty`` + 2MiB align (same as KVOffloadDecodeManager)
     - swap_memory: ``torch_npu.empty_with_swapped_memory``
+
+    WARNING: on some torch_npu builds, swapped tensors SIGSEGV if you touch
+    ``.shape`` / ``.device`` / ``.data_ptr()`` / ``zero_()`` / ``__repr__``.
+    Only pass them into the fused op; do not print or introspect them.
     """
     if backend == "offload":
         return _empty_aligned_cpu_tensor(shape, dtype=dtype)
@@ -110,88 +148,113 @@ def _alloc_cpu_kv_tensor(
             raise RuntimeError(
                 "cpu-kv-backend=swap_memory requires torch_npu.empty_with_swapped_memory"
             )
+        # Keep args minimal; do not print/return-repr the result here.
+        print(
+            "SWAP_EMPTY request_shape={} dtype={} (no tensor introspection)".format(
+                shape, dtype
+            ),
+            flush=True,
+        )
         return empty_swapped(tuple(shape), dtype=dtype, device="npu")
     raise ValueError(f"unknown cpu-kv-backend: {backend}")
+
+
+def _alloc_shared_host_kv(
+    topk: int,
+    cpu_kv_backend: CpuKvBackend,
+    max_seq_len: int | None,
+) -> dict:
+    """Allocate one shared full host KV for a topk/msl; reused across q_heads."""
+    msl = max_seq_len if max_seq_len is not None else max(topk * 4, 256)
+    assert msl >= topk, f"max_seq_len ({msl}) must be >= topk ({topk})"
+    fmbn = cdiv(msl, _BLOCK_SIZE)
+    dt = torch.bfloat16
+    kv_shape = [fmbn, _BLOCK_SIZE, _KVD]
+    rope_shape = [fmbn, _BLOCK_SIZE, _KRD]
+    cpu_kv_bytes = estimate_cpu_kv_bytes(msl, _BLOCK_SIZE)
+    # Print planned shapes only (Python lists). Never print swapped tensor.shape.
+    print(
+        "CPU_KV_PLAN backend={} max_seq_len={} block_size={} num_blocks={} "
+        "k_shape={} rope_shape={} est_bytes={:.3f} GiB".format(
+            cpu_kv_backend,
+            msl,
+            _BLOCK_SIZE,
+            fmbn,
+            kv_shape,
+            rope_shape,
+            cpu_kv_bytes / _GIB,
+        ),
+        flush=True,
+    )
+    full_kv_fused = _alloc_cpu_kv_tensor(cpu_kv_backend, kv_shape, dt)
+    full_rope_fused = _alloc_cpu_kv_tensor(cpu_kv_backend, rope_shape, dt)
+
+    if cpu_kv_backend == "offload":
+        # Timing only: inplace zero; do NOT torch.randn (extra host malloc).
+        _fill_host_kv_inplace(full_kv_fused)
+        _fill_host_kv_inplace(full_rope_fused)
+        print(
+            "FULL_KV_HOST backend=offload shape={} rope_shape={} dtype={} "
+            "device={} ptr_align={} bytes={:.3f} GiB".format(
+                tuple(full_kv_fused.shape),
+                tuple(full_rope_fused.shape),
+                dt,
+                full_kv_fused.device,
+                full_kv_fused.data_ptr() % _CPU_CACHE_ALIGNMENT == 0,
+                (
+                    full_kv_fused.numel() * full_kv_fused.element_size()
+                    + full_rope_fused.numel() * full_rope_fused.element_size()
+                )
+                / _GIB,
+            ),
+            flush=True,
+        )
+    else:
+        # swap_memory: skip zero_/shape/device/data_ptr — known SIGSEGV on some builds.
+        # Leave allocation as-is for timing; values are uninitialized.
+        print(
+            "FULL_KV_HOST backend=swap_memory requested_k_shape={} "
+            "requested_rope_shape={} dtype={} "
+            "(skip tensor introspection to avoid SIGSEGV)".format(
+                kv_shape, rope_shape, dt
+            ),
+            flush=True,
+        )
+
+    return {
+        "msl": msl,
+        "num_blocks": fmbn,
+        "full_kv_fused": full_kv_fused,
+        "full_rope_fused": full_rope_fused,
+    }
 
 
 def _build_inputs(
     topk: int,
     q_heads: int,
+    host_kv: dict,
     kv_heads: int = 1,
-    cpu_kv_backend: CpuKvBackend = "offload",
-    max_seq_len: int | None = None,
 ):
     assert q_heads % kv_heads == 0, "q_heads must be divisible by kv_heads"
     assert kv_heads == 1, "fused op currently requires kv_heads=1"
     assert topk > 0
-    assert cpu_kv_backend in ("offload", "swap_memory")
 
     bsz = 1
     seq = 1
     hd, krd, kvd = _KVD, _KRD, _KVD
     sbs = fbs = _BLOCK_SIZE
     stbs = 1
-    # Default legacy sizing; for 1M long-context set --max-seq-len 1048576.
-    msl = max_seq_len if max_seq_len is not None else max(topk * 4, 256)
-    assert msl >= topk, f"max_seq_len ({msl}) must be >= topk ({topk})"
-    fmbn = cdiv(msl, fbs)
+    msl = host_kv["msl"]
+    fmbn = host_kv["num_blocks"]
     smbn = cdiv(topk * stbs, sbs)
     dt = torch.bfloat16
     scale = 1.0 / math.sqrt(kvd)
     torch.manual_seed(910000 + topk + q_heads * 17)
     np.random.seed((910000 + topk + q_heads * 17) % (2**32 - 1))
 
-    cpu_kv_bytes = estimate_cpu_kv_bytes(msl, fbs)
-    print(
-        "CPU_KV_PLAN backend={} max_seq_len={} block_size={} num_blocks={} "
-        "k_shape=[{}, {}, {}] rope_shape=[{}, {}, {}] est_bytes={:.3f} GiB".format(
-            cpu_kv_backend,
-            msl,
-            fbs,
-            fmbn,
-            fmbn,
-            fbs,
-            kvd,
-            fmbn,
-            fbs,
-            krd,
-            cpu_kv_bytes / _GIB,
-        ),
-        flush=True,
-    )
-
     q = torch.randn(bsz * seq, q_heads, hd, dtype=dt, device="npu")
     q_rope = torch.randn(bsz * seq, q_heads, krd, dtype=dt, device="npu")
     q_fused = torch.cat([q, q_rope], dim=-1).contiguous()
-
-    kv_shape = [fmbn * bsz, fbs, kvd]
-    rope_shape = [fmbn * bsz, fbs, krd]
-    full_kv_fused = _alloc_cpu_kv_tensor(cpu_kv_backend, kv_shape, dt)
-    full_rope_fused = _alloc_cpu_kv_tensor(cpu_kv_backend, rope_shape, dt)
-    full_kv_fused.copy_(torch.randn(kv_shape, dtype=dt, device="cpu"))
-    full_rope_fused.copy_(torch.randn(rope_shape, dtype=dt, device="cpu"))
-
-    print(
-        "FULL_KV_HOST backend={} shape={} rope_shape={} dtype={} "
-        "device={} ptr_align={} bytes={:.3f} GiB".format(
-            cpu_kv_backend,
-            tuple(full_kv_fused.shape),
-            tuple(full_rope_fused.shape),
-            dt,
-            full_kv_fused.device,
-            (
-                full_kv_fused.data_ptr() % _CPU_CACHE_ALIGNMENT == 0
-                if cpu_kv_backend == "offload"
-                else "n/a"
-            ),
-            (
-                full_kv_fused.numel() * full_kv_fused.element_size()
-                + full_rope_fused.numel() * full_rope_fused.element_size()
-            )
-            / _GIB,
-        ),
-        flush=True,
-    )
 
     full_bt = torch.arange(fmbn, dtype=torch.int32, device="npu").unsqueeze(0).expand(bsz, -1).contiguous()
     actual_q = torch.tensor([seq] * bsz, dtype=torch.int32, device="npu")
@@ -219,8 +282,8 @@ def _build_inputs(
         "stbs": stbs,
         "scale": scale,
         "q_fused": q_fused,
-        "full_kv_fused": full_kv_fused,
-        "full_rope_fused": full_rope_fused,
+        "full_kv_fused": host_kv["full_kv_fused"],
+        "full_rope_fused": host_kv["full_rope_fused"],
         "full_bt": full_bt,
         "actual_q": actual_q,
         "actual_k": actual_k,
@@ -272,17 +335,12 @@ def _bench_fused(inp, warmup: int, iters: int) -> float:
 def run_case(
     topk: int,
     q_heads: int,
+    host_kv: dict,
     warmup: int,
     iters: int,
     cpu_kv_backend: CpuKvBackend = "offload",
-    max_seq_len: int | None = None,
 ) -> float:
-    inp = _build_inputs(
-        topk,
-        q_heads,
-        cpu_kv_backend=cpu_kv_backend,
-        max_seq_len=max_seq_len,
-    )
+    inp = _build_inputs(topk, q_heads, host_kv=host_kv)
     print(
         "CASE topk={} q_heads={} kv_heads={} max_seq_len={} num_blocks={} "
         "cpu_kv_backend={} q_shape={} topk_shape={}".format(
@@ -390,16 +448,22 @@ def main():
     results = []
     try:
         for topk in cases:
-            for q_heads in q_heads_list:
-                avg_ms = run_case(
-                    topk,
-                    q_heads,
-                    warmup=args.warmup,
-                    iters=args.iters,
-                    cpu_kv_backend=cpu_kv_backend,
-                    max_seq_len=max_seq_len,
-                )
-                results.append((topk, q_heads, avg_ms))
+            # One host KV per topk/msl; reuse across q_heads to avoid pool OOM.
+            host_kv = _alloc_shared_host_kv(topk, cpu_kv_backend, max_seq_len)
+            try:
+                for q_heads in q_heads_list:
+                    avg_ms = run_case(
+                        topk,
+                        q_heads,
+                        host_kv=host_kv,
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        cpu_kv_backend=cpu_kv_backend,
+                    )
+                    results.append((topk, q_heads, avg_ms))
+            finally:
+                del host_kv
+                gc.collect()
     finally:
         if cpu_kv_backend == "offload":
             try:
