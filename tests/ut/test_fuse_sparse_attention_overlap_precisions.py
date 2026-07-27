@@ -317,31 +317,103 @@ def _call_fused(inp):
     )
 
 
-def _bench_fused_eager(inp, warmup: int, iters: int) -> float:
-    for _ in range(warmup):
-        _ = _call_fused(inp)
+def _apply_hit_ratio(inp, hit_ratio: float) -> int:
+    """Set selection status so the next fused call has the target positional hit ratio.
+
+    Kernel hit condition is positional: ``status[i] == topk[i]``.
+    - First ``round(hit_ratio * topk)`` slots are marked hit (status = topk)
+    - Remaining slots are ``-1`` (miss, will H2D from full KV)
+
+    Returns the number of hit slots per row.
+    """
+    if not 0.0 <= hit_ratio <= 1.0:
+        raise ValueError(f"hit_ratio must be in [0, 1], got {hit_ratio}")
+    topk = inp["topk_fused"]
+    status = inp["sel_status"]
+    k = topk.shape[-1]
+    n_hit = int(round(hit_ratio * k))
+    n_hit = max(0, min(k, n_hit))
+
+    # status layout: [B, S, H, K+1]; last elem is side-channel, keep -1.
+    status.fill_(-1)
+    if n_hit > 0:
+        status[..., :n_hit] = topk[..., :n_hit]
+    return n_hit
+
+
+def _prime_selection_cache(inp) -> None:
+    """One full-miss call so sel_kv/sel_rope hold current topk (for realistic hits)."""
+    _apply_hit_ratio(inp, 0.0)
+    _ = _call_fused(inp)
+    torch.npu.synchronize()
+
+
+def _bench_loop(run_once, prepare, warmup: int, iters: int) -> float:
+    """Time ``run_once``; ``prepare`` runs before each timed iter (not included)."""
+    for _ in range(max(0, warmup)):
+        if prepare is not None:
+            prepare()
+            torch.npu.synchronize()
+        run_once()
     torch.npu.synchronize()
 
     start = torch.npu.Event(enable_timing=True)
     end = torch.npu.Event(enable_timing=True)
-    start.record()
+    total_ms = 0.0
     for _ in range(iters):
+        if prepare is not None:
+            prepare()
+            torch.npu.synchronize()
+        start.record()
+        run_once()
+        end.record()
+        torch.npu.synchronize()
+        total_ms += start.elapsed_time(end)
+    return total_ms / iters
+
+
+def _bench_fused_eager(inp, warmup: int, iters: int, hit_ratio: float) -> float:
+    _prime_selection_cache(inp)
+    n_hit = _apply_hit_ratio(inp, hit_ratio)
+    print(
+        "HIT_RATIO target={:.4f} n_hit={}/{}".format(
+            hit_ratio, n_hit, inp["topk_fused"].shape[-1]
+        ),
+        flush=True,
+    )
+
+    def prepare():
+        _apply_hit_ratio(inp, hit_ratio)
+
+    def run_once():
         _ = _call_fused(inp)
-    end.record()
-    torch.npu.synchronize()
-    return start.elapsed_time(end) / iters
+
+    return _bench_loop(run_once, prepare, warmup=warmup, iters=iters)
 
 
-def _bench_fused_graph(inp, warmup: int, iters: int) -> float:
+def _bench_fused_graph(inp, warmup: int, iters: int, hit_ratio: float) -> float:
     """Capture fused op into ACL graph and time ``graph.replay()``."""
     if not hasattr(torch.npu, "NPUGraph"):
         raise RuntimeError("torch.npu.NPUGraph is unavailable on this torch_npu build")
 
-    # Eager warmup first (compile / cache / selection status settle).
+    _prime_selection_cache(inp)
+    n_hit = _apply_hit_ratio(inp, hit_ratio)
+    print(
+        "HIT_RATIO target={:.4f} n_hit={}/{}".format(
+            hit_ratio, n_hit, inp["topk_fused"].shape[-1]
+        ),
+        flush=True,
+    )
+
+    # Eager warmup at target hit ratio (compile / settle).
     for _ in range(max(1, warmup)):
+        _apply_hit_ratio(inp, hit_ratio)
+        torch.npu.synchronize()
         _ = _call_fused(inp)
     torch.npu.synchronize()
 
+    _apply_hit_ratio(inp, hit_ratio)
+    torch.npu.synchronize()
     graph = torch.npu.NPUGraph()
     print("GRAPH_CAPTURE begin", flush=True)
     try:
@@ -361,18 +433,14 @@ def _bench_fused_graph(inp, warmup: int, iters: int) -> float:
         flush=True,
     )
 
-    for _ in range(warmup):
-        graph.replay()
-    torch.npu.synchronize()
+    def prepare():
+        # Replay reads same addresses; rewrite status so each replay keeps target hit ratio.
+        _apply_hit_ratio(inp, hit_ratio)
 
-    start = torch.npu.Event(enable_timing=True)
-    end = torch.npu.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
+    def run_once():
         graph.replay()
-    end.record()
-    torch.npu.synchronize()
-    return start.elapsed_time(end) / iters
+
+    return _bench_loop(run_once, prepare, warmup=warmup, iters=iters)
 
 
 def run_case(
@@ -383,12 +451,13 @@ def run_case(
     iters: int,
     cpu_kv_backend: CpuKvBackend = "offload",
     use_graph: bool = False,
+    hit_ratio: float = 1.0,
 ) -> float:
     inp = _build_inputs(topk, q_heads, host_kv=host_kv)
     mode = "graph" if use_graph else "eager"
     print(
         "CASE topk={} q_heads={} kv_heads={} max_seq_len={} num_blocks={} "
-        "cpu_kv_backend={} mode={} q_shape={} topk_shape={}".format(
+        "cpu_kv_backend={} mode={} hit_ratio={:.4f} q_shape={} topk_shape={}".format(
             topk,
             q_heads,
             inp["kv_heads"],
@@ -396,6 +465,7 @@ def run_case(
             inp["num_blocks"],
             cpu_kv_backend,
             mode,
+            hit_ratio,
             tuple(inp["q_fused"].shape),
             tuple(inp["topk_fused"].shape),
         ),
@@ -403,12 +473,13 @@ def run_case(
     )
 
     if use_graph:
-        avg_ms = _bench_fused_graph(inp, warmup=warmup, iters=iters)
+        avg_ms = _bench_fused_graph(inp, warmup=warmup, iters=iters, hit_ratio=hit_ratio)
     else:
-        avg_ms = _bench_fused_eager(inp, warmup=warmup, iters=iters)
+        avg_ms = _bench_fused_eager(inp, warmup=warmup, iters=iters, hit_ratio=hit_ratio)
     print(
-        "BENCH mode={} topk={} q_heads={} max_seq_len={} warmup={} iters={} avg_ms={:.3f}".format(
-            mode, topk, q_heads, inp["msl"], warmup, iters, avg_ms
+        "BENCH mode={} hit_ratio={:.4f} topk={} q_heads={} max_seq_len={} "
+        "warmup={} iters={} avg_ms={:.3f}".format(
+            mode, hit_ratio, topk, q_heads, inp["msl"], warmup, iters, avg_ms
         ),
         flush=True,
     )
@@ -459,6 +530,14 @@ def parse_args():
         help="Capture fused op into torch.npu.NPUGraph and time graph.replay() "
         "(ACL graph / aclgraph path). Default is eager launch timing.",
     )
+    parser.add_argument(
+        "--hit-ratio",
+        type=float,
+        default=1.0,
+        help="Target selection/topk-buffer positional reuse ratio in [0, 1]. "
+        "Each timed iter resets status so the first round(hit_ratio*topk) slots "
+        "are hits and the rest are misses. Default 1.0 (all hit).",
+    )
     # Backward-compatible: bare `script.py 64,1024` still works.
     parser.add_argument("legacy_topk", nargs="?", default=None)
     return parser.parse_args()
@@ -471,6 +550,9 @@ def main():
     q_heads_list = [int(x) for x in args.q_heads.split(",") if x]
     cpu_kv_backend: CpuKvBackend = args.cpu_kv_backend
     max_seq_len = args.max_seq_len
+    hit_ratio = args.hit_ratio
+    if not 0.0 <= hit_ratio <= 1.0:
+        raise ValueError(f"--hit-ratio must be in [0, 1], got {hit_ratio}")
     plan_msl = max_seq_len if max_seq_len is not None else max(max(cases) * 4, 256)
     need_bytes = estimate_cpu_kv_bytes(plan_msl)
     dram_size_gb = args.dram_size_gb
@@ -493,6 +575,7 @@ def main():
         f"{cases=} {q_heads_list=} max_seq_len={plan_msl} "
         f"num_blocks={cdiv(plan_msl, _BLOCK_SIZE)} "
         f"warmup={args.warmup} iters={args.iters} mode={mode} "
+        f"hit_ratio={hit_ratio} "
         f"cpu_kv_backend={cpu_kv_backend} dram_size_gb={dram_size_gb} "
         f"cpu_kv_est_gib={need_bytes / _GIB:.3f}",
         flush=True,
@@ -516,8 +599,9 @@ def main():
                         iters=args.iters,
                         cpu_kv_backend=cpu_kv_backend,
                         use_graph=args.use_graph,
+                        hit_ratio=hit_ratio,
                     )
-                    results.append((topk, q_heads, mode, avg_ms))
+                    results.append((topk, q_heads, mode, hit_ratio, avg_ms))
             finally:
                 del host_kv
                 gc.collect()
@@ -529,10 +613,10 @@ def main():
                 print(f"OFFLOAD_UNINIT_WARN {type(exc).__name__}: {exc}", flush=True)
 
     print("----- TIMING SUMMARY -----", flush=True)
-    for topk, q_heads, bench_mode, avg_ms in results:
+    for topk, q_heads, bench_mode, ratio, avg_ms in results:
         print(
-            "mode={} topk={} q_heads={} avg_ms={:.3f}".format(
-                bench_mode, topk, q_heads, avg_ms
+            "mode={} hit_ratio={:.4f} topk={} q_heads={} avg_ms={:.3f}".format(
+                bench_mode, ratio, topk, q_heads, avg_ms
             ),
             flush=True,
         )
