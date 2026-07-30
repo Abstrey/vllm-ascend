@@ -243,7 +243,7 @@ class KVOffloadDecodeManager:
         return layer_id
 
     def _restore_bfloat16_tensor(self, ptr: int, shape: list[int]) -> torch.Tensor:
-        view = self.sparse_kv_offload_cpp.restore_bfloat16_tensor(ptr, shape)
+        view = self.kv_offload_decode_cpp.restore_bfloat16_tensor(ptr, shape)
         if int(view.data_ptr()) != int(ptr):
             raise RuntimeError(
                 "restore_bfloat16_tensor returned a tensor with unexpected data_ptr: "
@@ -274,7 +274,7 @@ class KVOffloadDecodeManager:
         if not self.use_fused_overlap:
             raise RuntimeError(
                 "get_fused_overlap_cpu_kv_inputs requires "
-                "sparse_kv_offload_config.use_fused_overlap=true"
+                "kv_offload_decode_config.use_fused_overlap=true"
             )
         layer_id = self._get_offload_layer_id(layer_name)
         if layer_id >= len(self.k_caches_cpu) or layer_id >= len(self.v_caches_cpu):

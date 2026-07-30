@@ -1397,6 +1397,7 @@ def enable_dsa_cp() -> bool:
 
 @lru_cache(maxsize=1)
 def enable_dsa_cp_with_o_proj_tp() -> bool:
+    return enable_dsa_cp()
     if not enable_dsa_cp():
         return False
     from vllm.config import get_current_vllm_config

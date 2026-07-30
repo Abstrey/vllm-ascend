@@ -185,12 +185,12 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         self.block_size = self.vllm_config.cache_config.block_size
 
         try:
-            offload_cfg = get_ascend_config().sparse_kv_offload_config
+            offload_cfg = get_ascend_config().kv_offload_decode_config
             self.use_fused_overlap = bool(getattr(offload_cfg, "use_fused_overlap", False))
             self.lru_resident_capacity = int(offload_cfg.topk_buffer_size)
             self.sfa_sparse_topk = int(offload_cfg.topk)
         except Exception:
-            raw_cfg = (self.vllm_config.additional_config or {}).get("sparse_kv_offload_config", {})
+            raw_cfg = (self.vllm_config.additional_config or {}).get("kv_offload_decode_config", {})
             self.use_fused_overlap = bool(raw_cfg.get("use_fused_overlap", False))
             self.lru_resident_capacity = int(raw_cfg.get("topk_buffer_size", 4096))
             self.sfa_sparse_topk = int(
@@ -198,7 +198,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             )
         if self.lru_resident_capacity % self.block_size != 0:
             raise ValueError(
-                "sparse_kv_offload_config.topk_buffer_size must be divisible by "
+                "kv_offload_decode_config.topk_buffer_size must be divisible by "
                 f"block_size ({self.block_size}); got {self.lru_resident_capacity}"
             )
         decode_width = 1
@@ -882,7 +882,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 f"num_tokens={num_tokens} num_reqs={num_reqs}"
             )
 
-        manager = get_sparse_kv_offload_manager()
+        manager = get_kv_offload_decode_manager()
         fused_op = self._require_custom_op("npu_fused_sparse_attention_overlap")
         topk_indices_decode = self._normalize_fused_overlap_topk_indices(
             topk_indices_decode,
