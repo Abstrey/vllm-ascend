@@ -19,7 +19,7 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.backend import Backend
@@ -574,6 +574,7 @@ class TestMemcacheBackendMethods(unittest.TestCase):
             backend._is_a2 = False
             backend._registered_buffers = None
             backend._buffers_registered = False
+            backend._batch_get_key_info_supports_flag = None
             return backend
 
     def test_exists(self):
@@ -588,6 +589,29 @@ class TestMemcacheBackendMethods(unittest.TestCase):
 
         self.assertIs(b.batch_get_key_info(["k1"], flag=1), key_infos)
         b.store.batch_get_key_info.assert_called_once_with(["k1"], flag=1)
+
+    def test_batch_get_key_info_supports_new_binding_without_flag(self):
+        b = self._make_backend()
+        key_infos = [MagicMock()]
+        b.store.batch_get_key_info.side_effect = [
+            TypeError("batch_get_key_info(): incompatible function arguments."),
+            key_infos,
+            key_infos,
+        ]
+
+        self.assertIs(b.batch_get_key_info(["k1"], flag=1), key_infos)
+        self.assertIs(b.batch_get_key_info(["k2"], flag=1), key_infos)
+        self.assertEqual(
+            b.store.batch_get_key_info.call_args_list,
+            [call(["k1"], flag=1), call(["k1"]), call(["k2"])],
+        )
+
+    def test_batch_get_key_info_reraises_other_type_errors(self):
+        b = self._make_backend()
+        b.store.batch_get_key_info.side_effect = TypeError("store failure")
+
+        with self.assertRaisesRegex(TypeError, "store failure"):
+            b.batch_get_key_info(["k1"], flag=1)
 
     def test_register_buffer(self):
         b = self._make_backend()

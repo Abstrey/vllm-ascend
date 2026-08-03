@@ -2245,7 +2245,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "npu_fused_sparse_attention_overlap(Tensor query, Tensor(a!) selection_k_rope, "
         "Tensor(b!) selection_kv_cache, Tensor(c!) selection_kv_block_table, "
-        "Tensor(d!) selection_kv_block_status, Tensor selection_topk_indices, "
+        "Tensor(d!) selection_kv_block_status, Tensor(e!) selection_membership_map, "
+        "Tensor selection_topk_indices, "
         "Tensor full_k_rope, Tensor full_kv_cache, Tensor full_kv_block_table, "
         "Tensor full_kv_actual_seq, Tensor full_q_actual_seq, "
         "float scale_value, int sparse_block_size, int selection_topk_block_size, *, "

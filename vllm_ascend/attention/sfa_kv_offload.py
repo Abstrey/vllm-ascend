@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 import torch
 import torch_npu
@@ -53,10 +53,30 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import (
+    FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+    FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT,
     get_kv_offload_decode_manager,
 )
 
 M = TypeVar("M", bound=AscendSFAMetadata)
+_FSA_SELECTION_STATUS_ALIGNMENT = 8
+
+
+class _FusedOverlapDecodeCommonInputs(NamedTuple):
+    seq_len_thresholds: torch.Tensor
+    current_req_ids: torch.Tensor
+    stable_prefix_lens: torch.Tensor
+    full_kv_block_table: torch.Tensor
+    full_kv_actual_seq: torch.Tensor
+    full_q_actual_seq: torch.Tensor
+
+
+def _fsa_selection_status_stride(topk: int) -> int:
+    return (
+        (topk + 1 + _FSA_SELECTION_STATUS_ALIGNMENT - 1)
+        // _FSA_SELECTION_STATUS_ALIGNMENT
+        * _FSA_SELECTION_STATUS_ALIGNMENT
+    )
 
 
 def _check_device_kv_cache_exist() -> None:
@@ -210,14 +230,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         )
         self.selection_kv_block_table: torch.Tensor | None = None
         self.selection_kv_block_status: torch.Tensor | None = None
+        self.selection_membership_map: torch.Tensor | None = None
         self.fused_overlap_last_req_ids: torch.Tensor | None = None
         self._fused_overlap_selection_capacity: tuple[int, int, int, int] | None = None
         self._fused_overlap_decode_logged = False
         self._sfa_decode_dump_step_idx = 0
-        # Cumulative selection hit stats for VLLM_ASCEND_SFA_DEBUG (eager only).
-        self._fused_overlap_hit_total_hits = 0
-        self._fused_overlap_hit_total_valid = 0
-        self._fused_overlap_hit_num_steps = 0
 
     def _resolve_preprocess_type(self, act_dtype: torch.dtype) -> PreprocessType:
         logger.warning_once(
@@ -358,6 +375,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             layer_name = self._offload_layer_name()
             k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
             manager.offload_new_kv(
+                layer_name=layer_name,
                 slot_mapping=slots,
                 k_cache_cpu=k_cache_cpu,
                 v_cache_cpu=v_cache_cpu,
@@ -366,7 +384,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 k=k_nope,
                 v=k_pe,
                 has_prefill=False,
-                capturing=self._in_graph_runtime(),
+                capturing=get_forward_context().capturing,
             )
             return k_pe, k_nope
 
@@ -379,6 +397,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         layer_name = self._offload_layer_name()
         k_cache_cpu, v_cache_cpu = self._cpu_cache_pair(manager, layer_name)
         manager.offload_new_kv(
+            layer_name=layer_name,
             slot_mapping=slots,
             k_cache_cpu=k_cache_cpu,
             v_cache_cpu=v_cache_cpu,
@@ -387,7 +406,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             k=None,
             v=None,
             has_prefill=True,
-            capturing=self._in_graph_runtime(),
+            capturing=get_forward_context().capturing,
         )
         return result
 
@@ -601,9 +620,8 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         topk_head_count: int,
         topk: int,
         cache_blocks_per_row: int,
-        runtime_blocks_per_row: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         cache_token_capacity = max(self.max_num_topk_rows, token_count)
         cache_topk_head_capacity = max(topk_head_count, 1)
         cache_topk_capacity = max(self.sfa_sparse_topk, topk)
@@ -618,6 +636,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         needs_realloc = (
             self.selection_kv_block_table is None
             or self.selection_kv_block_status is None
+            or self.selection_membership_map is None
             or self.fused_overlap_last_req_ids is None
             or self._fused_overlap_selection_capacity is None
             or self._fused_overlap_selection_capacity[0] < cache_token_capacity
@@ -626,19 +645,36 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             or self._fused_overlap_selection_capacity[3] < cache_blocks_per_row
             or self.selection_kv_block_table.device != device
             or self.selection_kv_block_status.device != device
+            or self.selection_membership_map.device.type != "cpu"
             or self.fused_overlap_last_req_ids.device != device
         )
         if needs_realloc:
+            if get_forward_context().capturing:
+                raise RuntimeError(
+                    "fused_overlap selection state must be preallocated before "
+                    "NPUGraph capture: "
+                    f"required_capacity={capacity} "
+                    f"current_capacity={self._fused_overlap_selection_capacity}"
+                )
             self.selection_kv_block_table = torch.arange(
                 selection_block_count,
                 dtype=torch.int32,
                 device=device,
-            ).view(row_capacity, cache_blocks_per_row)
+            ).reshape(row_capacity, cache_blocks_per_row)
             self.selection_kv_block_status = torch.full(
-                (cache_token_capacity, cache_topk_head_capacity, cache_topk_capacity + 1),
+                (
+                    cache_token_capacity,
+                    cache_topk_head_capacity,
+                    _fsa_selection_status_stride(cache_topk_capacity),
+                ),
                 -1,
                 dtype=torch.int32,
                 device=device,
+            )
+            self.selection_membership_map = (
+                get_kv_offload_decode_manager().allocate_fused_overlap_membership_map(
+                    row_capacity
+                )
             )
             self.fused_overlap_last_req_ids = torch.full(
                 (cache_token_capacity,),
@@ -649,29 +685,38 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             self._fused_overlap_selection_capacity = capacity
             logger.info(
                 "[fused_overlap_offload][selection] allocate token_capacity=%s "
-                "topk_heads=%s topk=%s blocks_per_row=%s",
+                "topk_heads=%s topk=%s blocks_per_row=%s membership_shape=%s",
                 cache_token_capacity,
                 cache_topk_head_capacity,
                 cache_topk_capacity,
                 cache_blocks_per_row,
+                tuple(self.selection_membership_map.shape),
             )
         assert self.selection_kv_block_table is not None
         assert self.selection_kv_block_status is not None
+        assert self.selection_membership_map is not None
         assert self.fused_overlap_last_req_ids is not None
         return (
-            self.selection_kv_block_table[: token_count * topk_head_count, :runtime_blocks_per_row],
-            self.selection_kv_block_status[:token_count, :topk_head_count, : topk + 1],
+            self.selection_kv_block_table[:, :cache_blocks_per_row],
+            self.selection_kv_block_status[
+                :,
+                :cache_topk_head_capacity,
+                :_fsa_selection_status_stride(topk),
+            ],
+            self.selection_membership_map,
             self.fused_overlap_last_req_ids[:token_count],
         )
 
     def _invalidate_fused_overlap_selection_rows(
         self,
         selection_kv_block_status: torch.Tensor,
+        selection_membership_map: torch.Tensor,
         last_req_ids: torch.Tensor,
         attn_metadata: M,
         *,
         num_tokens: int,
         num_reqs: int,
+        topk_count: int,
         seq_lens: torch.Tensor,
         cum_query_lens: torch.Tensor,
     ) -> None:
@@ -697,6 +742,19 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         # Row reuse by a different request: drop the whole selection status row.
         changed_rows = last_req_ids != current_req_ids
         selection_kv_block_status.masked_fill_(changed_rows.view(num_tokens, 1, 1), -1)
+        membership_rows = selection_membership_map.reshape(
+            num_tokens, -1, selection_membership_map.shape[-1]
+        )
+        membership_control = membership_rows[
+            ...,
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT:
+            FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT
+            + FSA_SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT,
+        ]
+        membership_control.view(torch.int32).masked_fill_(
+            changed_rows.view(num_tokens, 1, 1),
+            -1,
+        )
         last_req_ids.copy_(current_req_ids)
 
         # Selection status stores absolute topk token indices. History hits can
@@ -710,80 +768,19 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         query_lens = torch.diff(cum_query_lens, prepend=cum_query_lens.new_zeros(1))
         rewrite_start = (seq_lens - query_lens)[token_to_req].view(num_tokens, 1, 1)
         rewrite_end = seq_lens[token_to_req].view(num_tokens, 1, 1)
-        topk_status = selection_kv_block_status[..., :-1]
+        topk_status = selection_kv_block_status[..., :topk_count]
         rewritten_hits = (
             (topk_status >= 0)
             & (topk_status >= rewrite_start)
             & (topk_status < rewrite_end)
         )
         oob_hits = (topk_status >= 0) & (topk_status >= rewrite_end)
-        topk_status.masked_fill_(rewritten_hits | oob_hits, -1)
-
-        if envs_ascend.VLLM_ASCEND_SFA_DEBUG and not get_forward_context().capturing:
-            logger.info(
-                "[fused_overlap_offload][selection][debug] num_tokens=%s num_reqs=%s "
-                "changed_rows=%s rewritten_topk_hits=%s oob_topk_hits=%s",
-                num_tokens,
-                num_reqs,
-                int(changed_rows.sum().item()),
-                int(rewritten_hits.sum().item()),
-                int(oob_hits.sum().item()),
-            )
-
-    def _maybe_log_fused_overlap_selection_hit_ratio(
-        self,
-        *,
-        layer_name: str,
-        selection_kv_block_status: torch.Tensor,
-        selection_topk_indices: torch.Tensor,
-    ) -> None:
-        """Log expected selection hit ratio after invalidate (eager + debug only).
-
-        A topk entry is counted as hit if its absolute token id already exists in
-        that row's ``selection_kv_block_status[..., :-1]``. This matches the
-        kernel's status-lookup precondition; it is not a kernel-internal counter.
-        """
-        if not envs_ascend.VLLM_ASCEND_SFA_DEBUG or get_forward_context().capturing:
-            return
-        topk_status = selection_kv_block_status[..., :-1]
-        topk = selection_topk_indices
-        if topk.shape[:2] != topk_status.shape[:2] or topk.shape[-1] > topk_status.shape[-1]:
-            logger.warning(
-                "[fused_overlap_offload][selection][hit] skip layer=%s "
-                "shape mismatch topk=%s status=%s",
-                layer_name,
-                tuple(topk.shape),
-                tuple(topk_status.shape),
-            )
-            return
-        valid = topk >= 0
-        # [T, H, K, 1] == [T, H, 1, S] -> any over cached status slots.
-        hits = (topk.unsqueeze(-1) == topk_status.unsqueeze(-2)).any(dim=-1) & valid
-        valid_count = int(valid.sum().item())
-        hit_count = int(hits.sum().item())
-        miss_count = valid_count - hit_count
-        hit_ratio = (hit_count / valid_count) if valid_count > 0 else 0.0
-        self._fused_overlap_hit_total_hits += hit_count
-        self._fused_overlap_hit_total_valid += valid_count
-        self._fused_overlap_hit_num_steps += 1
-        avg_hit_ratio = (
-            self._fused_overlap_hit_total_hits / self._fused_overlap_hit_total_valid
-            if self._fused_overlap_hit_total_valid > 0
-            else 0.0
-        )
-        logger.info(
-            "[fused_overlap_offload][selection][hit] layer=%s "
-            "valid_topk=%s hit=%s miss=%s hit_ratio=%.4f avg_hit_ratio=%.4f "
-            "(steps=%s total_valid=%s total_hit=%s)",
-            layer_name,
-            valid_count,
-            hit_count,
-            miss_count,
-            hit_ratio,
-            avg_hit_ratio,
-            self._fused_overlap_hit_num_steps,
-            self._fused_overlap_hit_total_valid,
-            self._fused_overlap_hit_total_hits,
+        invalidated_status = rewritten_hits | oob_hits
+        topk_status.masked_fill_(invalidated_status, -1)
+        membership_control.view(torch.int32).masked_fill_(
+            changed_rows.view(num_tokens, 1, 1)
+            | invalidated_status.any(dim=-1, keepdim=True),
+            -1,
         )
 
     def _validate_fused_overlap_mtp_decode_metadata(
@@ -864,44 +861,59 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
         token_block_table = full_kv_block_table[token_to_req].contiguous()
         return token_q_cum, token_kv_lens, token_block_table
 
-    def _execute_fused_overlap_offload_decode(
+    def _prepare_fused_overlap_decode_common_inputs(
         self,
-        ql_nope_decode: torch.Tensor,
-        q_pe_decode: torch.Tensor,
-        topk_indices_decode: torch.Tensor,
         attn_metadata: M,
+        *,
+        num_tokens: int,
+        num_reqs: int,
+        topk_indices_decode: torch.Tensor,
         actual_seq_lengths_query_decode: torch.Tensor,
         actual_seq_lengths_key_decode: torch.Tensor,
-        layer_name: str,
-    ) -> torch.Tensor:
-        num_tokens = ql_nope_decode.shape[0]
-        num_reqs = int(getattr(attn_metadata, "num_decodes", 0) or 0)
-        if num_tokens <= 0 or num_reqs <= 0:
-            raise RuntimeError(
-                "fused_overlap decode requires positive num_tokens and num_reqs: "
-                f"num_tokens={num_tokens} num_reqs={num_reqs}"
-            )
-
-        manager = get_kv_offload_decode_manager()
-        fused_op = self._require_custom_op("npu_fused_sparse_attention_overlap")
-        topk_indices_decode = self._normalize_fused_overlap_topk_indices(
-            topk_indices_decode,
-            num_tokens,
-            ql_nope_decode.device,
-        )
-        # Match legacy onload: drop indexer padding (-1) and unwritten
-        # tail-block indices (>= seq_len) before the fused op reads CPU KV.
+    ) -> _FusedOverlapDecodeCommonInputs:
         if attn_metadata.token_to_req is None:
             raise RuntimeError(
                 "fused_overlap offload requires token_to_req metadata for topk masking"
             )
+        if attn_metadata.req_ids_tensor is None:
+            raise RuntimeError(
+                "fused_overlap offload requires req_ids_tensor metadata"
+            )
+
+        forward_context = get_forward_context()
+        cache_key = (
+            num_tokens,
+            num_reqs,
+            topk_indices_decode.ndim,
+            topk_indices_decode.dtype,
+            topk_indices_decode.device,
+            attn_metadata.token_to_req.data_ptr(),
+            attn_metadata.req_ids_tensor.data_ptr(),
+            attn_metadata.block_table.data_ptr(),
+            actual_seq_lengths_query_decode.data_ptr(),
+            actual_seq_lengths_key_decode.data_ptr(),
+            envs_ascend.VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN,
+        )
+        cache = getattr(
+            forward_context,
+            "_fsa_offload_decode_common_inputs",
+            None,
+        )
+        if cache is None:
+            cache = {}
+            forward_context._fsa_offload_decode_common_inputs = cache
+        cached_inputs = cache.get(cache_key)
+        if cached_inputs is not None:
+            return cached_inputs
+
+        device = topk_indices_decode.device
         token_to_req = attn_metadata.token_to_req[:num_tokens].to(
-            device=topk_indices_decode.device,
+            device=device,
             dtype=torch.long,
         )
         decode_seq_lens = torch.index_select(
             actual_seq_lengths_key_decode[:num_reqs].to(
-                device=topk_indices_decode.device,
+                device=device,
                 dtype=topk_indices_decode.dtype,
             ),
             0,
@@ -911,32 +923,46 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             num_tokens,
             *([1] * (topk_indices_decode.ndim - 1)),
         )
-        valid_topk = build_valid_topk_mask(topk_indices_decode, seq_len_thresholds)
-        topk_indices_decode = torch.where(
-            valid_topk,
-            topk_indices_decode,
-            torch.full_like(topk_indices_decode, -1),
+        current_req_ids = torch.index_select(
+            attn_metadata.req_ids_tensor[:num_reqs].to(
+                device=device,
+                dtype=torch.int64,
+            ),
+            0,
+            token_to_req,
         )
-        topk_head_count = topk_indices_decode.shape[1]
-        topk = topk_indices_decode.shape[2]
-        runtime_blocks_per_row = max(self._ceil_div(topk, self.block_size), 1)
-        cache_blocks_per_row = self.lru_resident_capacity // self.block_size
-        if runtime_blocks_per_row > cache_blocks_per_row:
-            raise RuntimeError(
-                "fused_overlap topk exceeds selection buffer capacity: "
-                f"topk={topk} runtime_blocks_per_row={runtime_blocks_per_row} "
-                f"resident_capacity={self.lru_resident_capacity} block_size={self.block_size}"
+        decode_cum_query_lens = actual_seq_lengths_query_decode[:num_reqs].to(
+            device=device,
+            dtype=torch.int32,
+        )
+        decode_query_lens = torch.diff(
+            decode_cum_query_lens,
+            prepend=decode_cum_query_lens.new_zeros(1),
+        )
+        stable_prefix_lens = (
+            actual_seq_lengths_key_decode[:num_reqs].to(
+                device=device,
+                dtype=torch.int32,
             )
-
-        full_kv_cache_cpu, full_k_rope_cpu = manager.get_fused_overlap_cpu_kv_inputs(layer_name)
-        full_kv_cache = self._flatten_pa_cache(full_kv_cache_cpu).contiguous()
-        full_k_rope = self._flatten_pa_cache(full_k_rope_cpu).contiguous()
+            - decode_query_lens
+        ).clamp_min_(0)
+        decode_stable_prefix_lens = torch.index_select(
+            stable_prefix_lens,
+            0,
+            token_to_req,
+        )
         full_kv_block_table = self._to_int32_device(
             attn_metadata.block_table[:num_reqs],
-            ql_nope_decode.device,
+            device,
         ).contiguous()
-        full_kv_actual_seq = self._to_int32_device(actual_seq_lengths_key_decode, ql_nope_decode.device)
-        full_q_actual_seq = self._to_int32_device(actual_seq_lengths_query_decode, ql_nope_decode.device)
+        full_kv_actual_seq = self._to_int32_device(
+            actual_seq_lengths_key_decode,
+            device,
+        )
+        full_q_actual_seq = self._to_int32_device(
+            actual_seq_lengths_query_decode,
+            device,
+        )
         self._validate_fused_overlap_mtp_decode_metadata(
             attn_metadata,
             num_tokens=num_tokens,
@@ -944,7 +970,10 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             full_q_actual_seq=full_q_actual_seq,
             full_kv_actual_seq=full_kv_actual_seq,
         )
-        if num_tokens != num_reqs and envs_ascend.VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN:
+        if (
+            num_tokens != num_reqs
+            and envs_ascend.VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN
+        ):
             full_q_actual_seq, full_kv_actual_seq, full_kv_block_table = (
                 self._flatten_fused_overlap_mtp_to_token_batch(
                     attn_metadata,
@@ -956,7 +985,11 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 )
             )
         elif num_tokens != num_reqs:
-            if not getattr(self, "_fused_overlap_mtp_no_flatten_logged", False):
+            if not getattr(
+                self,
+                "_fused_overlap_mtp_no_flatten_logged",
+                False,
+            ):
                 logger.warning(
                     "[fused_overlap_offload] MTP flatten disabled "
                     "(VLLM_ASCEND_FUSED_OVERLAP_MTP_FLATTEN=0); keeping native TND "
@@ -987,42 +1020,121 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
                 f"num_tokens={num_tokens} num_reqs={num_reqs}"
             )
 
+        common_inputs = _FusedOverlapDecodeCommonInputs(
+            seq_len_thresholds=seq_len_thresholds,
+            current_req_ids=current_req_ids,
+            stable_prefix_lens=decode_stable_prefix_lens,
+            full_kv_block_table=full_kv_block_table,
+            full_kv_actual_seq=full_kv_actual_seq,
+            full_q_actual_seq=full_q_actual_seq,
+        )
+        cache[cache_key] = common_inputs
+        return common_inputs
+
+    def _execute_fused_overlap_offload_decode(
+        self,
+        ql_nope_decode: torch.Tensor,
+        q_pe_decode: torch.Tensor,
+        topk_indices_decode: torch.Tensor,
+        attn_metadata: M,
+        actual_seq_lengths_query_decode: torch.Tensor,
+        actual_seq_lengths_key_decode: torch.Tensor,
+        layer_name: str,
+    ) -> torch.Tensor:
+        num_tokens = ql_nope_decode.shape[0]
+        num_reqs = int(getattr(attn_metadata, "num_decodes", 0) or 0)
+        if num_tokens <= 0 or num_reqs <= 0:
+            raise RuntimeError(
+                "fused_overlap decode requires positive num_tokens and num_reqs: "
+                f"num_tokens={num_tokens} num_reqs={num_reqs}"
+            )
+
+        manager = get_kv_offload_decode_manager()
+        fused_op = self._require_custom_op("npu_fused_sparse_attention_overlap")
+        topk_indices_decode = self._normalize_fused_overlap_topk_indices(
+            topk_indices_decode,
+            num_tokens,
+            ql_nope_decode.device,
+        )
+        common_inputs = self._prepare_fused_overlap_decode_common_inputs(
+            attn_metadata,
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            topk_indices_decode=topk_indices_decode,
+            actual_seq_lengths_query_decode=actual_seq_lengths_query_decode,
+            actual_seq_lengths_key_decode=actual_seq_lengths_key_decode,
+        )
+        topk_head_count = topk_indices_decode.shape[1]
+        topk = topk_indices_decode.shape[2]
+        if topk_head_count != 1:
+            raise ValueError(
+                "external fused_overlap planner requires one TopK head, "
+                f"got {topk_head_count}"
+            )
+        runtime_blocks_per_row = max(self._ceil_div(topk, self.block_size), 1)
+        cache_blocks_per_row = self.lru_resident_capacity // self.block_size
+        if runtime_blocks_per_row > cache_blocks_per_row:
+            raise RuntimeError(
+                "fused_overlap topk exceeds selection buffer capacity: "
+                f"topk={topk} runtime_blocks_per_row={runtime_blocks_per_row} "
+                f"resident_capacity={self.lru_resident_capacity} block_size={self.block_size}"
+            )
+
+        full_kv_cache_cpu, full_k_rope_cpu = manager.get_fused_overlap_cpu_kv_inputs(layer_name)
+        full_kv_cache = self._flatten_pa_cache(full_kv_cache_cpu).contiguous()
+        full_k_rope = self._flatten_pa_cache(full_k_rope_cpu).contiguous()
+        full_kv_block_table = common_inputs.full_kv_block_table
+        full_kv_actual_seq = common_inputs.full_kv_actual_seq
+        full_q_actual_seq = common_inputs.full_q_actual_seq
+
         layer_id = manager._get_offload_layer_id(layer_name)
-        row_count = num_tokens * topk_head_count
+        selection_row_count = max(self.max_num_topk_rows, num_tokens) * topk_head_count
         selection_kv_cache = self._flatten_selection_buffer(
             manager.topk_buffers_k[layer_id],
-            row_count=row_count,
+            row_count=selection_row_count,
             blocks_per_row=cache_blocks_per_row,
             name="selection_kv_cache",
         )
         selection_k_rope = self._flatten_selection_buffer(
             manager.topk_buffers_v[layer_id],
-            row_count=row_count,
+            row_count=selection_row_count,
             blocks_per_row=cache_blocks_per_row,
             name="selection_k_rope",
         )
-        selection_block_table, selection_block_status, last_req_ids = self._ensure_fused_overlap_selection_state(
+        (
+            selection_block_table,
+            selection_block_status,
+            selection_membership_map,
+            last_req_ids,
+        ) = self._ensure_fused_overlap_selection_state(
             token_count=num_tokens,
             topk_head_count=topk_head_count,
             topk=topk,
             cache_blocks_per_row=cache_blocks_per_row,
-            runtime_blocks_per_row=runtime_blocks_per_row,
             device=ql_nope_decode.device,
         )
-        self._invalidate_fused_overlap_selection_rows(
-            selection_block_status,
-            last_req_ids,
-            attn_metadata,
-            num_tokens=num_tokens,
-            num_reqs=num_reqs,
-            seq_lens=actual_seq_lengths_key_decode,
-            cum_query_lens=actual_seq_lengths_query_decode,
-        )
-        self._maybe_log_fused_overlap_selection_hit_ratio(
+        external_plan_prepared = manager.prepare_fused_overlap_external_plan(
             layer_name=layer_name,
-            selection_kv_block_status=selection_block_status,
-            selection_topk_indices=topk_indices_decode,
+            num_tokens=num_tokens,
+            topk_indices_npu=topk_indices_decode.squeeze(1),
+            req_ids_npu=common_inputs.current_req_ids,
+            stable_prefix_lens_npu=common_inputs.stable_prefix_lens,
+            visible_seq_lens_npu=full_kv_actual_seq,
+            selection_membership_map=selection_membership_map,
+            capturing=get_forward_context().capturing,
         )
+        if not external_plan_prepared:
+            self._invalidate_fused_overlap_selection_rows(
+                selection_block_status,
+                selection_membership_map,
+                last_req_ids,
+                attn_metadata,
+                num_tokens=num_tokens,
+                num_reqs=num_reqs,
+                topk_count=topk,
+                seq_lens=actual_seq_lengths_key_decode,
+                cum_query_lens=actual_seq_lengths_query_decode,
+            )
 
         if not self._fused_overlap_decode_logged:
             logger.info(
@@ -1049,6 +1161,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             "selection_kv_cache": selection_kv_cache,
             "selection_kv_block_table": selection_block_table,
             "selection_kv_block_status": selection_block_status,
+            "selection_membership_map": selection_membership_map,
             "selection_topk_indices": topk_indices_decode,
             "full_k_rope": full_k_rope,
             "full_kv_cache": full_kv_cache,
@@ -1062,6 +1175,13 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             "layout_kv": "PA_BSND",
             "sparse_mode": 3,
         }
+        manager.inject_current_kv_into_selection(
+            layer_name=layer_name,
+            num_tokens=num_tokens,
+            selection_kv_cache=selection_kv_cache,
+            selection_k_rope=selection_k_rope,
+            capturing=get_forward_context().capturing,
+        )
         self._maybe_dump_first_decode_op_inputs(
             layer_name=layer_name,
             mode="fused",
@@ -1076,6 +1196,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             op_name="npu_fused_sparse_attention_overlap",
             output=attn_output,
         )
+        manager.wait_for_current_kv_writeback(get_forward_context().capturing)
         return attn_output
 
     def _execute_sparse_flash_attention_process(

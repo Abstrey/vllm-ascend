@@ -34,6 +34,7 @@ namespace optiling {
 constexpr uint32_t PRE_LOAD_NUM = 2;
 constexpr uint32_t BLOCK_TABLE_ELEM_BYTE = 4;
 constexpr int32_t SPARSE_MODE_BAND = 4;
+constexpr uint32_t SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT = 16400;
 
 static const std::string QUERY_NAME = "query";
 static const std::string KEY_NAME = "key";
@@ -382,6 +383,50 @@ void FusedSparseAttentionOverlapMlaTiling::FillTilingBaseParamsMla()
     tilingData_.baseParams.set_nextTokens(sfaInfo_->nextTokens);
     tilingData_.baseParams.set_sparseBlockSize(sfaInfo_->sparseBlockSize);
     tilingData_.baseParams.set_sparseBlockCount(sfaInfo_->sparseBlockCount);
+    uint32_t selectionBlockTableStride =
+        static_cast<uint32_t>((sfaInfo_->sparseBlockCount + sfaInfo_->blockSize - 1) /
+                              sfaInfo_->blockSize);
+    if (IsFusedSparseAttentionOverlapStandaloneOp(sfaInfo_->opName)) {
+        const gert::StorageShape *selectionBlockTableShape =
+            context_->GetInputShape(SELECTION_KV_BLOCK_TABLE_INPUT_INDEX);
+        if (selectionBlockTableShape != nullptr &&
+            selectionBlockTableShape->GetStorageShape().GetDimNum() > 0) {
+            int64_t blockTableLastDim = selectionBlockTableShape->GetStorageShape().GetDim(
+                selectionBlockTableShape->GetStorageShape().GetDimNum() - 1);
+            if (blockTableLastDim >= static_cast<int64_t>(selectionBlockTableStride)) {
+                selectionBlockTableStride = static_cast<uint32_t>(blockTableLastDim);
+            }
+        }
+    }
+    tilingData_.baseParams.set_selectionBlockTableStride(selectionBlockTableStride);
+    uint32_t selectionStatusStride = sfaInfo_->sparseBlockCount + 1;
+    if (IsFusedSparseAttentionOverlapStandaloneOp(sfaInfo_->opName)) {
+        const gert::StorageShape *selectionStatusShape =
+            context_->GetInputShape(SELECTION_KV_BLOCK_STATUS_INPUT_INDEX);
+        if (selectionStatusShape != nullptr &&
+            selectionStatusShape->GetStorageShape().GetDimNum() > 0) {
+            int64_t statusLastDim = selectionStatusShape->GetStorageShape().GetDim(
+                selectionStatusShape->GetStorageShape().GetDimNum() - 1);
+            if (statusLastDim >= static_cast<int64_t>(selectionStatusStride)) {
+                selectionStatusStride = static_cast<uint32_t>(statusLastDim);
+            }
+        }
+    }
+    tilingData_.baseParams.set_selectionStatusStride(selectionStatusStride);
+    uint32_t selectionMembershipStride = SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT;
+    if (IsFusedSparseAttentionOverlapStandaloneOp(sfaInfo_->opName)) {
+        const gert::StorageShape *selectionMembershipShape =
+            context_->GetInputShape(SELECTION_MEMBERSHIP_MAP_INPUT_INDEX);
+        if (selectionMembershipShape != nullptr &&
+            selectionMembershipShape->GetStorageShape().GetDimNum() > 0) {
+            int64_t membershipLastDim = selectionMembershipShape->GetStorageShape().GetDim(
+                selectionMembershipShape->GetStorageShape().GetDimNum() - 1);
+            if (membershipLastDim >= static_cast<int64_t>(selectionMembershipStride)) {
+                selectionMembershipStride = static_cast<uint32_t>(membershipLastDim);
+            }
+        }
+    }
+    tilingData_.baseParams.set_selectionMembershipStride(selectionMembershipStride);
     tilingData_.baseParams.set_attentionMode(sfaInfo_->attentionMode);
     tilingData_.baseParams.set_returnSoftmaxLse(sfaInfo_->returnSoftmaxLse);
     tilingData_.baseParams.set_isActualLenDimsNull(sfaInfo_->actualQSeqLenFlag ? 0U : 1U);
