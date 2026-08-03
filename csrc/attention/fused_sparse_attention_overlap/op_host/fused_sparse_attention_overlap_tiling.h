@@ -35,6 +35,9 @@ constexpr uint32_t ACT_SEQ_LEN_Q_INPUT_INDEX = 5;
 constexpr uint32_t ACT_SEQ_LEN_KV_INPUT_INDEX = 6;
 constexpr uint32_t QUERY_ROPE_INPUT_INDEX = 7;
 constexpr uint32_t KEY_ROPE_INPUT_INDEX = 8;
+constexpr uint32_t SELECTION_KV_BLOCK_TABLE_INPUT_INDEX = 11;
+constexpr uint32_t SELECTION_KV_BLOCK_STATUS_INPUT_INDEX = 12;
+constexpr uint32_t SELECTION_MEMBERSHIP_MAP_INPUT_INDEX = 13;
 // Outputs Index
 constexpr uint32_t OUTPUT_INDEX = 0;
 constexpr uint32_t SOFTMAXMAX_INDEX = 1;
@@ -166,6 +169,9 @@ TILING_DATA_FIELD_DEF(uint32_t, attentionMode)
 TILING_DATA_FIELD_DEF(uint32_t, returnSoftmaxLse)
 TILING_DATA_FIELD_DEF(int64_t, sparseBlockSize)
 TILING_DATA_FIELD_DEF(uint32_t, sparseBlockCount)
+TILING_DATA_FIELD_DEF(uint32_t, selectionBlockTableStride)
+TILING_DATA_FIELD_DEF(uint32_t, selectionStatusStride)
+TILING_DATA_FIELD_DEF(uint32_t, selectionMembershipStride)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsNull)
 TILING_DATA_FIELD_DEF(uint32_t, isActualLenDimsKVNull)
 END_TILING_DATA_DEF

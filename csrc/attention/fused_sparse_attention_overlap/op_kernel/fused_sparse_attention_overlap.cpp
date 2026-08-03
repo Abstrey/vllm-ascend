@@ -12,7 +12,8 @@ using namespace AscendC;
         op.Init(query, key, value, sparseIndices, actualSeqLengthsQuery, actualSeqLengthsKV,       \
             blocktable, queryRope, keyRope, attentionOut, user, tiling_data, tiling, &tPipe);       \
         op.InitSelectionUpdateGlobalTensor(selectionKRope, selectionKvCache,                       \
-            selectionKvBlockTable, selectionKvBlockStatus, selectionKvActualSeq, true);            \
+            selectionKvBlockTable, selectionKvBlockStatus, selectionMembershipMap,                 \
+            selectionKvActualSeq, true);                                                           \
         op.Process();                                                                              \
     } while (0)
 
@@ -24,6 +25,7 @@ __global__ __aicore__ void fused_sparse_attention_overlap(
     __gm__ uint8_t *queryRope, __gm__ uint8_t *keyRope,
     __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
     __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
+    __gm__ uint8_t *selectionMembershipMap,
     __gm__ uint8_t *attentionOut, __gm__ uint8_t *selectionKvActualSeq,
     __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {

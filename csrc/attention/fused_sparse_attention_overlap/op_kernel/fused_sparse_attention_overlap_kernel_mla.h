@@ -75,6 +75,7 @@ public:
                                 __gm__ uint8_t *selectionKvCache,
                                 __gm__ uint8_t *selectionKvBlockTable,
                                 __gm__ uint8_t *selectionKvBlockStatus,
+                                __gm__ uint8_t *selectionMembershipMap,
                                 __gm__ uint8_t *selectionKvActualSeq,
                                 bool enableSelectionUpdate);
 
@@ -221,6 +222,9 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
     constInfo.headDimRope = headDimRope;
     constInfo.sparseBlockSize = tilingData->baseParams.sparseBlockSize;
     constInfo.sparseBlockCount = tilingData->baseParams.sparseBlockCount;
+    constInfo.selectionBlockTableStride = tilingData->baseParams.selectionBlockTableStride;
+    constInfo.selectionStatusStride = tilingData->baseParams.selectionStatusStride;
+    constInfo.selectionMembershipStride = tilingData->baseParams.selectionMembershipStride;
     constInfo.sparseMode = tilingData->baseParams.sparseMode;
 
     constInfo.preLoadNum = PRELOAD_NUM;
@@ -384,7 +388,8 @@ template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::InitSelectionUpdateGlobalTensor(
     __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
     __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
-    __gm__ uint8_t *selectionKvActualSeq, bool enableSelectionUpdate)
+    __gm__ uint8_t *selectionMembershipMap, __gm__ uint8_t *selectionKvActualSeq,
+    bool enableSelectionUpdate)
 {
     if (!enableSelectionUpdate) {
         return;
@@ -394,22 +399,29 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
     GlobalTensor<KV_T> selectionKvCacheGm;
     GlobalTensor<int32_t> selectionKvBlockTableGm;
     GlobalTensor<int32_t> selectionKvBlockStatusGm;
+    GlobalTensor<int16_t> selectionMembershipMapGm;
     GlobalTensor<int32_t> selectionKvActualSeqGm;
     selectionKRopeGm.SetGlobalBuffer((__gm__ KV_T *)selectionKRope);
     selectionKvCacheGm.SetGlobalBuffer((__gm__ KV_T *)selectionKvCache);
     selectionKvBlockTableGm.SetGlobalBuffer((__gm__ int32_t *)selectionKvBlockTable);
     selectionKvBlockStatusGm.SetGlobalBuffer((__gm__ int32_t *)selectionKvBlockStatus);
+    selectionMembershipMapGm.SetGlobalBuffer((__gm__ int16_t *)selectionMembershipMap);
     selectionKvActualSeqGm.SetGlobalBuffer((__gm__ int32_t *)selectionKvActualSeq);
 
     int64_t selectionKvBlockSize = constInfo.kvCacheBlockSize;
     if (selectionKvBlockSize <= 0) {
         return;
     }
-    int64_t selectionMaxBlockNum =
-        (static_cast<int64_t>(constInfo.sparseBlockCount) + selectionKvBlockSize - 1) / selectionKvBlockSize;
+    int64_t selectionMaxBlockNum = constInfo.selectionBlockTableStride;
+    if (selectionMaxBlockNum <= 0) {
+        selectionMaxBlockNum =
+            (static_cast<int64_t>(constInfo.sparseBlockCount) + selectionKvBlockSize - 1) /
+            selectionKvBlockSize;
+    }
     vectorService.InitSelectionUpdateGlobalTensor(selectionKRopeGm, selectionKvCacheGm,
-        selectionKvBlockTableGm, selectionKvBlockStatusGm, selectionKvActualSeqGm,
-        selectionKvBlockSize, selectionMaxBlockNum, 1, true);
+        selectionKvBlockTableGm, selectionKvBlockStatusGm, selectionMembershipMapGm,
+        selectionKvActualSeqGm, selectionKvBlockSize, selectionMaxBlockNum, 1,
+        constInfo.selectionStatusStride, constInfo.selectionMembershipStride, true);
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
@@ -763,11 +775,10 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
 template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::Process()
 {
     if ASCEND_IS_AIV {
-        if (aiCoreIdx >= usedCoreNum && vectorService.IsSelectionUpdateEnabled() &&
-            vectorService.UseAllCoreSelectionUpdate()) {
-            vectorService.RunAllCoreSelectionUpdate();
-        }
+        vectorService.RunAllCoreSelectionUpdate();
     }
+    SyncAll<false>();
+
     if (aiCoreIdx < usedCoreNum) {
         if ASCEND_IS_AIV {
             vectorService.AllocEventID();
@@ -778,10 +789,6 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
         ProcessBalance();
 
         if ASCEND_IS_AIV {
-            if (vectorService.IsSelectionUpdateEnabled() && vectorService.UseAllCoreSelectionUpdate() &&
-                !vectorService.UsePipelineSelectionUpdate()) {
-                vectorService.RunAllCoreSelectionUpdate();
-            }
             vectorService.FreeEventID();
         } else {
             matmulService.FreeEventID();

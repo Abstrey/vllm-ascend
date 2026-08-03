@@ -50,8 +50,11 @@ public:
         const GlobalTensor<KV_T> &selectionKRopeGm, const GlobalTensor<KV_T> &selectionKvCacheGm,
         const GlobalTensor<int32_t> &selectionKvBlockTableGm,
         const GlobalTensor<int32_t> &selectionKvBlockStatusGm,
+        const GlobalTensor<int16_t> &selectionMembershipMapGm,
         const GlobalTensor<int32_t> &selectionKvActualSeqGm, int64_t selectionKvBlockSize,
-        int64_t selectionMaxBlockNum, int64_t selectionTopkBlockSize, bool enableSelectionUpdate);
+        int64_t selectionMaxBlockNum, int64_t selectionTopkBlockSize,
+        int64_t selectionStatusStride, int64_t selectionMembershipStride,
+        bool enableSelectionUpdate);
     __aicore__ inline void InitVec1GlobalTensor(GlobalTensor<MM1_OUT_T> mm1ResGm, GlobalTensor<KV_T> vec1ResGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsQGm,
                                                 GlobalTensor<int32_t> actualSeqLengthsKVGm, GlobalTensor<T> lseMaxFdGm,
@@ -70,19 +73,114 @@ public:
     __aicore__ inline void MergeKv(const RunInfo &runInfo);
     __aicore__ inline int64_t GetKeyGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
     __aicore__ inline int64_t GetKeyRopeGmOffset(int64_t realS2Idx, const RunInfo &runInfo, int64_t s2IdLimit);
+    __aicore__ inline bool CanUsePairedKvCopy(
+        int64_t realS2Idx1, int64_t realS2Idx2,
+        int64_t keyOffset1, int64_t keyOffset2, int64_t s2IdLimit,
+        const RunInfo &runInfo, int64_t &keySrcStride, int64_t &keyRopeSrcStride);
+    __aicore__ inline bool CanUsePairedSelectionCopy(
+        int64_t selectionTokenOffset1, int64_t selectionTokenOffset2,
+        int64_t &kvSrcStride, int64_t &ropeSrcStride);
     __aicore__ inline void GetRealS2Idx(int64_t s2GmOffset, int64_t &realS2Idx, int64_t topkGmBaseOffset,
                                         const RunInfo &runInfo);
+    __aicore__ inline int64_t GetSelectionRow(const RunInfo &runInfo);
+    __aicore__ inline int64_t GetSelectionTokenOffset(int64_t selectionRow, int64_t topkPos,
+                                                       int32_t topkValue, int32_t currentStatus,
+                                                       int64_t &cachedBlockTableIdx, int32_t &cachedBlockNum);
+    __aicore__ inline int64_t GetSelectionSlotTokenOffset(
+        int64_t selectionRow, int32_t selectionSlot,
+        int64_t &cachedBlockTableIdx, int32_t &cachedBlockNum);
     __aicore__ inline void CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx1,
-                                    int64_t realS2Idx2, const RunInfo &runInfo);
+                                    int64_t realS2Idx2, int64_t selectionTokenOffset1,
+                                    int64_t selectionTokenOffset2, int64_t s2IdLimit,
+                                    const RunInfo &runInfo);
+    __aicore__ inline void CopyInSelectionKvRun(int64_t &mte2Size, int64_t mte3Size,
+                                                int64_t mergeMte3Idx, int64_t selectionTokenOffset,
+                                                int64_t tokenCount);
+    __aicore__ inline void CopyInSelectionKvPair(
+        int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+        int64_t selectionTokenOffset, int64_t kvSrcStride, int64_t ropeSrcStride);
     __aicore__ inline void CopyOutMrgeResult(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                              int64_t mergeMte3Idx, const RunInfo &runInfo);
     __aicore__ inline void CopyOutSelectionUpdate(int64_t mte2Size, int64_t mte3Size, int64_t s2StartGmOffset,
                                                   int64_t mergeMte3Idx, const RunInfo &runInfo);
     __aicore__ inline void CopyOutSelectionUpdateFromKvMerge(const RunInfo &runInfo);
+    __aicore__ inline void CopyOutSparseSelectionUpdateFromKvMerge(const RunInfo &runInfo);
     __aicore__ inline bool IsSelectionUpdateEnabled() const;
     __aicore__ inline bool UseAllCoreSelectionUpdate() const;
     __aicore__ inline bool UsePipelineSelectionUpdate() const;
+    __aicore__ inline void SnapshotSelectionSourceReadyAtEntry();
     __aicore__ inline void RunAllCoreSelectionUpdate();
+    __aicore__ inline bool UseSetResidentSelection() const;
+    __aicore__ inline void ProcessSetResidentSelectionRow(
+        int64_t selectionRow, uint32_t batchIdx, int64_t s2IdLimit);
+    __aicore__ inline bool IsPositionResidentSelectionHit(
+        LocalTensor<int32_t> currentTopkLocal,
+        LocalTensor<int32_t> residentStatusLocal,
+        LocalTensor<int32_t> scratchLocal,
+        int32_t previousValidCount);
+    __aicore__ inline bool IsTokenSetResidentSelectionHit(
+        LocalTensor<int32_t> currentTopkLocal,
+        LocalTensor<int16_t> membershipStorageLocal,
+        LocalTensor<uint32_t> membershipByteOffsetLocal,
+        LocalTensor<int16_t> gatheredMembershipLocal,
+        LocalTensor<int32_t> gatheredMembershipInt32Local,
+        int64_t membershipBase, int32_t previousValidCount, int64_t s2IdLimit,
+        bool &membershipSlotMapLoaded);
+    __aicore__ inline bool IsSelectionMembershipMapReady(
+        int64_t membershipBase, LocalTensor<int16_t> controlLocal);
+    __aicore__ inline void ClearSelectionUpdatePlanMarker(int64_t membershipBase);
+    __aicore__ inline void WriteSelectionUpdatePlan(
+        int64_t membershipBase, int32_t planCount, int32_t selectionHitCount,
+        LocalTensor<int16_t> membershipStorageLocal, int64_t planOffset,
+        bool preserveMembershipMap);
+    __aicore__ inline void WriteSparseSelectionUpdatePlan(
+        int64_t membershipBase, int32_t updateCount,
+        LocalTensor<int16_t> membershipStorageLocal, int64_t planOffset);
+    __aicore__ inline void PublishTokenSetResidentSelectionMap(
+        LocalTensor<int32_t> residentStatusLocal,
+        LocalTensor<int16_t> membershipStorageLocal,
+        int64_t membershipBase, int32_t validTopkNum, int64_t s2IdLimit);
+    __aicore__ inline int32_t BuildDenseResidentSelectionPlan(
+        LocalTensor<int32_t> gatheredSlotLocal,
+        LocalTensor<int32_t> insertStatusLocal,
+        LocalTensor<int32_t> hitSourceLocal);
+    __aicore__ inline int16_t EncodeSelectionPlanValue(int32_t planValue) const;
+    __aicore__ inline bool IsSelectionPlanHit(int16_t planValue) const;
+    __aicore__ inline bool IsSelectionPlanUpdate(int16_t planValue) const;
+    __aicore__ inline int32_t DecodeSelectionPlanSlot(int16_t planValue) const;
+    __aicore__ inline int32_t BuildSetResidentSelectionPlan(
+        int64_t selectionRow, int64_t selectionGroupBaseRow, int64_t s2IdLimit,
+        LocalTensor<int32_t> currentTopkLocal,
+        LocalTensor<int32_t> residentStatusLocal,
+        LocalTensor<int32_t> sourceStatusLocal,
+        LocalTensor<uint32_t> indexLocal,
+        LocalTensor<int32_t> insertStatusLocal,
+        LocalTensor<int32_t> hitSourceLocal,
+        LocalTensor<int32_t> sortBufferLocal);
+    __aicore__ inline void GatherValidSelectionTopk(
+        LocalTensor<int32_t> currentTopkLocal,
+        LocalTensor<int32_t> scratch0Local,
+        LocalTensor<uint32_t> scratch1Local,
+        LocalTensor<uint32_t> scratch2Local,
+        int32_t maxValidTokenId, int32_t &validTopkNum);
+    __aicore__ inline void SortSelectionTopk(
+        LocalTensor<int32_t> sourceLocal, LocalTensor<uint32_t> indexLocal,
+        LocalTensor<float> tempLocal, LocalTensor<float> sortedLocal,
+        LocalTensor<int32_t> sortedTopkLocal,
+        LocalTensor<uint32_t> sortedTopkIndexLocal, int32_t validNum);
+    __aicore__ inline void FindSelectionTopkHit(
+        LocalTensor<int32_t> sortedTopkLocal,
+        LocalTensor<uint32_t> sortedTopkIndexLocal,
+        LocalTensor<int32_t> sortedStatusLocal,
+        LocalTensor<uint32_t> sortedStatusIndexLocal,
+        LocalTensor<int32_t> insertStatusLocal,
+        LocalTensor<int32_t> hitSourceLocal,
+        int32_t validTopkNum, bool sameRow, int64_t sourceRow,
+        int32_t &maxSameRowHitSlot);
+    __aicore__ inline void CopySelectionUpdateTokenFromSelectionCache(
+        int64_t selectionRow, int64_t destinationSlot, int64_t encodedSourceSlot);
+    __aicore__ inline void MergeKvFromSelection(const RunInfo &runInfo);
+    __aicore__ inline void MergeKvFromSelectionWithSparseUpdates(const RunInfo &runInfo);
     __aicore__ inline uint64_t GetActualQSeqLenForSelectionUpdate(uint32_t batchIdx);
     __aicore__ inline uint64_t GetActualKVSeqLenForSelectionUpdate(uint32_t batchIdx);
     __aicore__ inline void CopySelectionUpdateTokenFromFullCache(
@@ -97,7 +195,8 @@ public:
     __aicore__ inline void SetMidInf(const LocalTensor<T> &mmResUb, uint32_t dealRowCount, uint32_t columnCount,
                                      uint64_t startId, uint64_t endId);
     __aicore__ inline void CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
-                                          int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo);
+                                          int64_t keyBNBOffset, int64_t selectionTokenOffset,
+                                          int64_t s2IdLimit, const RunInfo &runInfo);
     // ================================Vector1==========================================
     __aicore__ inline void ProcessVec1SingleBuf(const RunInfo &info, const MSplitInfo &mSplitInfo);
     __aicore__ inline void DealBmm1ResBaseBlock(const RunInfo &info, const MSplitInfo &mSplitInfo, uint32_t startRow,
@@ -151,6 +250,47 @@ private:
     static constexpr FusedSparseAttentionOverlapLayout KV_LAYOUT_T = FusedSparseAttentionOverlapTraits::kvLayout;
 
     static constexpr uint64_t MERGE_CACHE_GM_BUF_NUM = 4;
+    static constexpr int64_t SELECTION_STATUS_UB_OFFSET = 512;
+    static constexpr int32_t SELECTION_MAX_TOPK = 2048;
+    static constexpr int32_t SELECTION_SORT_UNIT = 32;
+    static constexpr int32_t SELECTION_COMPARE_SCALAR_NUM = 256 / sizeof(int32_t);
+    static constexpr int32_t SELECTION_COMPARE_MASK_UNIT = 16;
+    static constexpr int32_t SELECTION_SORT_BUFFER_COUNT = 8;
+    static constexpr int32_t SELECTION_POSITION_PROBE_COUNT = 4;
+    static constexpr int32_t SELECTION_MEMBERSHIP_MAX_TOKEN = 16376;
+    static constexpr int32_t SELECTION_MEMBERSHIP_MAP_INT16_COUNT =
+        SELECTION_MEMBERSHIP_MAX_TOKEN;
+    static constexpr int16_t SELECTION_MEMBERSHIP_READY_MARKER = 0x5A4D;
+    static constexpr int16_t SELECTION_PLAN_READY_MARKER = 0x5A50;
+    static constexpr int16_t SELECTION_SPARSE_PLAN_READY_MARKER = 0x5A53;
+    static constexpr int16_t SELECTION_EXTERNAL_PLAN_READY_MARKER = 0x5A45;
+    static constexpr int16_t SELECTION_DIRECT_LAYOUT_MARKER = 0x5A44;
+    static constexpr int16_t SELECTION_PAIRED_COPY_MARKER = 0x5A56;
+    static constexpr int32_t SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT = 8;
+    static constexpr int32_t SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT =
+        BYTE_BLOCK / sizeof(int16_t);
+    static constexpr int32_t SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT =
+        ((SELECTION_MEMBERSHIP_MAP_INT16_COUNT +
+          SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT - 1) /
+         SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT) *
+        SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT;
+    static constexpr int32_t SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT =
+        ((SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT +
+          SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT +
+          SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT - 1) /
+         SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT) *
+        SELECTION_MEMBERSHIP_ALIGNMENT_INT16_COUNT;
+    static constexpr int16_t SELECTION_COMPACT_PLAN_INVALID = 0;
+    static constexpr int32_t SELECTION_PLAN_UPDATE_FLAG = 1 << 30;
+    static constexpr int32_t SELECTION_PLAN_HIT_FLAG = 1 << 29;
+    static constexpr int32_t SELECTION_PLAN_DESTINATION_BITS = 11;
+    static constexpr int32_t SELECTION_PLAN_SLOT_MASK =
+        (1 << SELECTION_PLAN_DESTINATION_BITS) - 1;
+    static constexpr int32_t SELECTION_PLAN_HIT_SLOT_MASK = SELECTION_PLAN_HIT_FLAG - 1;
+    static constexpr int32_t SELECTION_SYNC_COPY_CAPACITY = 64;
+    static constexpr int32_t SELECTION_SYNC_COPY_THRESHOLD = 64;
+    static constexpr int32_t SELECTION_SPARSE_PLAN_VALUE_COUNT =
+        SELECTION_SYNC_COPY_CAPACITY * 2;
     static constexpr uint64_t SYNC_INPUT_BUF1_FLAG = 2;
     static constexpr uint64_t SYNC_INPUT_BUF1_PONG_FLAG = 3;
     static constexpr uint64_t SYNC_INPUT_BUF2_FLAG = 4;
@@ -194,15 +334,26 @@ private:
     GlobalTensor<KV_T> selectionKvCacheGm_;
     GlobalTensor<int32_t> selectionKvBlockTableGm_;
     GlobalTensor<int32_t> selectionKvBlockStatusGm_;
+    GlobalTensor<int16_t> selectionMembershipMapGm_;
     GlobalTensor<int32_t> selectionKvActualSeqGm_;
     int64_t selectionKvBlockSize_ = 0;
     int64_t selectionMaxBlockNum_ = 0;
     int64_t selectionTopkBlockSize_ = 0;
+    int64_t selectionStatusStride_ = 0;
+    int64_t selectionMembershipStride_ = 0;
     bool enableSelectionUpdate_ = false;
     bool useAllCoreSelectionUpdate_ = false;
+    bool selectionSourceReadyAtEntry_ = false;
+    bool selectionUpdatePlanActive_ = false;
+    bool selectionSparseUpdatePlanActive_ = false;
+    int64_t selectionUpdatePlanOffset_ = 0;
+    int32_t selectionUpdatePlanCount_ = 0;
+    int64_t selectionDataRow_ = -1;
+    int64_t selectionDirectRowStride_ = 0;
+    bool selectionPairedCopyActive_ = false;
 
     // ================================Local Buffer�?===================================
-    TBuf<> inputBuff1;            // 32K
+    TBuf<> inputBuff1;            // 64K
     TBuf<> inputBuff2;            // 16K
     TBuf<> outputBuff1;           // 32K
     TBuf<> outputBuff2;           // 4K
@@ -305,17 +456,27 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
     const GlobalTensor<KV_T> &selectionKRopeGm, const GlobalTensor<KV_T> &selectionKvCacheGm,
     const GlobalTensor<int32_t> &selectionKvBlockTableGm,
     const GlobalTensor<int32_t> &selectionKvBlockStatusGm,
+    const GlobalTensor<int16_t> &selectionMembershipMapGm,
     const GlobalTensor<int32_t> &selectionKvActualSeqGm, int64_t selectionKvBlockSize,
-    int64_t selectionMaxBlockNum, int64_t selectionTopkBlockSize, bool enableSelectionUpdate)
+    int64_t selectionMaxBlockNum, int64_t selectionTopkBlockSize,
+    int64_t selectionStatusStride, int64_t selectionMembershipStride,
+    bool enableSelectionUpdate)
 {
     this->selectionKRopeGm_ = selectionKRopeGm;
     this->selectionKvCacheGm_ = selectionKvCacheGm;
     this->selectionKvBlockTableGm_ = selectionKvBlockTableGm;
     this->selectionKvBlockStatusGm_ = selectionKvBlockStatusGm;
+    this->selectionMembershipMapGm_ = selectionMembershipMapGm;
     this->selectionKvActualSeqGm_ = selectionKvActualSeqGm;
     this->selectionKvBlockSize_ = selectionKvBlockSize;
     this->selectionMaxBlockNum_ = selectionMaxBlockNum;
     this->selectionTopkBlockSize_ = selectionTopkBlockSize;
+    int64_t minimumStatusStride = static_cast<int64_t>(constInfo.sparseBlockCount) + 1;
+    this->selectionStatusStride_ = selectionStatusStride >= minimumStatusStride ?
+        selectionStatusStride : minimumStatusStride;
+    this->selectionMembershipStride_ =
+        selectionMembershipStride >= SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT ?
+        selectionMembershipStride : SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT;
     this->enableSelectionUpdate_ = enableSelectionUpdate;
     this->useAllCoreSelectionUpdate_ = enableSelectionUpdate;
 }
@@ -434,7 +595,7 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
             // 场景一 s2Mid > s2ValidSizeFirstPart + oneBlk
             // 可以推导出s2StartCeilAlign < s2Mid   第一阶段取到s2StartCeilAlign
             // s2StartCeilAlign <= s2MidFloorAlign 第二阶段取到s2MidFloorAlign
-            // 场景�?s2Mid <= s2ValidSizeFirstPart + oneBlk 
+            // 场景�?s2Mid <= s2ValidSizeFirstPart + oneBlk
             // 可以推导�?s2StartCeilAlign >= s2Mid 第一阶段取到mid
             // s2StartCeilAlign > s2MidFloorAlign 第二阶段取到s2StartCeilAlign
             SetInfInBlk(mmResUb, dealRowCount, columnCount, s2ValidSizeFirstPart,
@@ -716,7 +877,7 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
         // (m,1)单次brcb扩充�?m,8), 重复16�? 扩充�?m,128)
         for (uint32_t i = 0; i < dGroupSize / elementPerBlock; i++) {
             Brcb(tmpQue[i * elementPerBlock],
-                 nUpdateTensor[loop * mSplitSize], 
+                 nUpdateTensor[loop * mSplitSize],
                  static_cast<uint8_t>((processMSize + elementPerBlock - 1) / elementPerBlock),
                  {static_cast<uint16_t>(dGroupSize / elementPerBlock), // 单次迭代内，目的操作数不同datablock间地址步长,单位为datablock
                   static_cast<uint16_t>(dGroupSize)});                 // 相邻迭代间，目的操作数相同datablock地址步长
@@ -802,6 +963,73 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int64_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::GetSelectionRow(const RunInfo &runInfo)
+{
+    int64_t qTokenOffset = 0;
+    if constexpr (LAYOUT_T == FusedSparseAttentionOverlapLayout::TND) {
+        uint64_t actualSeqQPrefixSum =
+            (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(runInfo.bIdx - 1);
+        qTokenOffset = static_cast<int64_t>(actualSeqQPrefixSum) +
+                       static_cast<int64_t>(runInfo.gS1Idx / constInfo.gSize);
+    } else {
+        qTokenOffset = static_cast<int64_t>(runInfo.bIdx) * static_cast<int64_t>(constInfo.qSeqSize) +
+                       static_cast<int64_t>(runInfo.gS1Idx / constInfo.gSize);
+    }
+    return qTokenOffset * static_cast<int64_t>(constInfo.kvHeadNum) +
+           static_cast<int64_t>(runInfo.n2Idx);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int64_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::GetSelectionTokenOffset(
+    int64_t selectionRow, int64_t topkPos, int32_t topkValue, int32_t currentStatus,
+    int64_t &cachedBlockTableIdx, int32_t &cachedBlockNum)
+{
+    if (topkValue < 0 || currentStatus != topkValue) {
+        return -1;
+    }
+
+    return GetSelectionSlotTokenOffset(
+        selectionRow, static_cast<int32_t>(topkPos), cachedBlockTableIdx, cachedBlockNum);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int64_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::GetSelectionSlotTokenOffset(
+    int64_t selectionRow, int32_t selectionSlot,
+    int64_t &cachedBlockTableIdx, int32_t &cachedBlockNum)
+{
+    if (selectionSlot < 0) {
+        return -1;
+    }
+    if (selectionDirectRowStride_ > 0) {
+        if (selectionSlot >= selectionDirectRowStride_) {
+            return -1;
+        }
+        return selectionRow * selectionDirectRowStride_ + selectionSlot;
+    }
+    if (selectionSlot >= static_cast<int32_t>(constInfo.sparseBlockCount)) {
+        return -1;
+    }
+
+    int64_t selectionBlockTableIdx = selectionSlot / selectionKvBlockSize_;
+    if (selectionBlockTableIdx >= selectionMaxBlockNum_) {
+        return -1;
+    }
+    if (selectionBlockTableIdx != cachedBlockTableIdx) {
+        cachedBlockTableIdx = selectionBlockTableIdx;
+        cachedBlockNum = selectionKvBlockTableGm_.GetValue(
+            selectionRow * selectionMaxBlockNum_ + selectionBlockTableIdx);
+    }
+    if (cachedBlockNum < 0) {
+        return -1;
+    }
+    return static_cast<int64_t>(cachedBlockNum) * selectionKvBlockSize_ +
+           selectionSlot % selectionKvBlockSize_;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline int64_t FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::GetKeyGmOffset(int64_t realS2Idx,
                                                                  const RunInfo &runInfo, int64_t s2IdLimit)
 {
@@ -839,11 +1067,60 @@ __aicore__ inline int64_t FusedSparseAttentionOverlapVectorService<FusedSparseAt
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CanUsePairedKvCopy(
+    int64_t realS2Idx1, int64_t realS2Idx2,
+    int64_t keyOffset1, int64_t keyOffset2, int64_t s2IdLimit,
+    const RunInfo &runInfo, int64_t &keySrcStride, int64_t &keyRopeSrcStride)
+{
+    keySrcStride = 0;
+    keyRopeSrcStride = 0;
+    if constexpr (PAGE_ATTENTION) {
+        int64_t blockTableSrcStride =
+            ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+              (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
+        keySrcStride = blockTableSrcStride * constInfo.headDim * sizeof(KV_T);
+        keyRopeSrcStride = blockTableSrcStride * constInfo.headDimRope * sizeof(KV_T);
+    } else {
+        int64_t keyRopeOffset1 = GetKeyRopeGmOffset(realS2Idx1, runInfo, s2IdLimit);
+        int64_t keyRopeOffset2 = GetKeyRopeGmOffset(realS2Idx2, runInfo, s2IdLimit);
+        keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
+                         (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) *
+                       constInfo.headDim * sizeof(KV_T);
+        keyRopeSrcStride = ((keyRopeOffset1 > keyRopeOffset2 ? (keyRopeOffset1 - keyRopeOffset2) :
+                             (keyRopeOffset2 - keyRopeOffset1)) - constInfo.sparseBlockSize) *
+                           constInfo.headDimRope * sizeof(KV_T);
+    }
+
+    return keySrcStride < INT32_MAX && keySrcStride >= 0 &&
+        (PAGE_ATTENTION || (keyRopeSrcStride < INT32_MAX && keyRopeSrcStride >= 0)) &&
+        realS2Idx1 + constInfo.sparseBlockSize < s2IdLimit &&
+        realS2Idx2 + constInfo.sparseBlockSize < s2IdLimit;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CanUsePairedSelectionCopy(
+    int64_t selectionTokenOffset1, int64_t selectionTokenOffset2,
+    int64_t &kvSrcStride, int64_t &ropeSrcStride)
+{
+    if (selectionDirectRowStride_ <= 0 ||
+        selectionTokenOffset1 < 0 || selectionTokenOffset2 <= selectionTokenOffset1) {
+        return false;
+    }
+    int64_t skippedTokens = selectionTokenOffset2 - selectionTokenOffset1 - 1;
+    kvSrcStride = skippedTokens * constInfo.headDim * sizeof(KV_T);
+    ropeSrcStride = skippedTokens * constInfo.headDimRope * sizeof(KV_T);
+    return kvSrcStride < INT32_MAX && ropeSrcStride < INT32_MAX;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void
 FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyInSingleKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t realS2Idx,
-                                       int64_t keyBNBOffset,int64_t s2IdLimit, const RunInfo &runInfo)
+                                       int64_t keyBNBOffset, int64_t selectionTokenOffset,
+                                       int64_t s2IdLimit, const RunInfo &runInfo)
 {
-    if (keyBNBOffset < 0) {
+    if (selectionTokenOffset < 0 && keyBNBOffset < 0) {
         return;
     }
     int64_t validS2Count =
@@ -854,22 +1131,109 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Cop
     intriParams.dstStride = 0;
     intriParams.srcStride = 0;
     DataCopyPadExtParams<KV_T> padParams;
-    DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + (mte2Size - mte3Size) * constInfo.headDim],
-                keyGm_[keyBNBOffset * constInfo.headDim], intriParams, padParams);
+    if (selectionTokenOffset >= 0) {
+        DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + (mte2Size - mte3Size) * constInfo.headDim],
+                    selectionKvCacheGm_[selectionTokenOffset * constInfo.headDim], intriParams, padParams);
+    } else {
+        DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + (mte2Size - mte3Size) * constInfo.headDim],
+                    keyGm_[keyBNBOffset * constInfo.headDim], intriParams, padParams);
+    }
     intriParams.blockLen = validS2Count * constInfo.headDimRope * sizeof(KV_T);
 
-    DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
-                keyRopeGm_[keyBNBOffset * constInfo.headDimRope], intriParams, padParams);
+    if (selectionTokenOffset >= 0) {
+        DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
+                    selectionKRopeGm_[selectionTokenOffset * constInfo.headDimRope], intriParams, padParams);
+    } else {
+        DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
+                    keyRopeGm_[keyBNBOffset * constInfo.headDimRope], intriParams, padParams);
+    }
     mte2Size += validS2Count;
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
-__aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
-                                                        int64_t realS2Idx1, int64_t realS2Idx2, const RunInfo &runInfo)
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyInSelectionKvRun(
+    int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx, int64_t selectionTokenOffset,
+    int64_t tokenCount)
 {
-    int64_t s2IdLimit = runInfo.curActualSeqLenOri;
-    if (constInfo.sparseMode == 3) {
-        s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size + runInfo.gS1Idx / constInfo.gSize + 1;
+    DataCopyExtParams copyParams;
+    copyParams.blockCount = static_cast<uint32_t>(tokenCount);
+    copyParams.blockLen = constInfo.headDim * sizeof(KV_T);
+    copyParams.srcStride = 0;
+    copyParams.dstStride = 0;
+    DataCopyPadExtParams<KV_T> padParams;
+    DataCopyPad(kvMergUb_[mergeMte3Idx % 2 * 32 * 512 + (mte2Size - mte3Size) * constInfo.headDim],
+                selectionKvCacheGm_[selectionTokenOffset * constInfo.headDim], copyParams, padParams);
+
+    copyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+    DataCopyPad(ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 + (mte2Size - mte3Size) * constInfo.headDimRope],
+                selectionKRopeGm_[selectionTokenOffset * constInfo.headDimRope], copyParams, padParams);
+    mte2Size += tokenCount;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyInSelectionKvPair(
+    int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+    int64_t selectionTokenOffset, int64_t kvSrcStride, int64_t ropeSrcStride)
+{
+    DataCopyExtParams copyParams;
+    copyParams.blockCount = 2;
+    copyParams.blockLen = constInfo.headDim * sizeof(KV_T);
+    copyParams.srcStride = kvSrcStride;
+    copyParams.dstStride = 0;
+    DataCopyPadExtParams<KV_T> padParams;
+    DataCopyPad(
+        kvMergUb_[mergeMte3Idx % 2 * 32 * 512 +
+                  (mte2Size - mte3Size) * constInfo.headDim],
+        selectionKvCacheGm_[selectionTokenOffset * constInfo.headDim],
+        copyParams, padParams);
+
+    copyParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+    copyParams.srcStride = ropeSrcStride;
+    DataCopyPad(
+        ropeMergUb_[mergeMte3Idx % 2 * 32 * 64 +
+                    (mte2Size - mte3Size) * constInfo.headDimRope],
+        selectionKRopeGm_[selectionTokenOffset * constInfo.headDimRope],
+        copyParams, padParams);
+    mte2Size += 2;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyInKv(int64_t &mte2Size, int64_t mte3Size, int64_t mergeMte3Idx,
+                                                        int64_t realS2Idx1, int64_t realS2Idx2,
+                                                        int64_t selectionTokenOffset1,
+                                                        int64_t selectionTokenOffset2, int64_t s2IdLimit,
+                                                        const RunInfo &runInfo)
+{
+    bool validS2Idx1 = realS2Idx1 >= 0 && realS2Idx1 < s2IdLimit;
+    bool validS2Idx2 = realS2Idx2 >= 0 && realS2Idx2 < s2IdLimit;
+    bool selectionHit1 = selectionTokenOffset1 >= 0 && validS2Idx1;
+    bool selectionHit2 = selectionTokenOffset2 >= 0 && validS2Idx2;
+    if (selectionHit1 || selectionHit2) {
+        if (selectionHit1 && selectionHit2 && selectionTokenOffset2 == selectionTokenOffset1 + 1) {
+            CopyInSelectionKvRun(mte2Size, mte3Size, mergeMte3Idx, selectionTokenOffset1, 2);
+            return;
+        }
+        int64_t kvSrcStride = 0;
+        int64_t ropeSrcStride = 0;
+        if (selectionPairedCopyActive_ && selectionHit1 && selectionHit2 &&
+            CanUsePairedSelectionCopy(
+                selectionTokenOffset1, selectionTokenOffset2,
+                kvSrcStride, ropeSrcStride)) {
+            CopyInSelectionKvPair(
+                mte2Size, mte3Size, mergeMte3Idx, selectionTokenOffset1,
+                kvSrcStride, ropeSrcStride);
+            return;
+        }
+
+        int64_t keyOffset1 = selectionHit1 ? -1 : GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
+        int64_t keyOffset2 = selectionHit2 ? -1 : GetKeyGmOffset(realS2Idx2, runInfo, s2IdLimit);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1,
+                       selectionHit1 ? selectionTokenOffset1 : -1, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2,
+                       selectionHit2 ? selectionTokenOffset2 : -1, s2IdLimit, runInfo);
+        return;
     }
 
     int64_t keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
@@ -880,29 +1244,13 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 
     int64_t keySrcStride = 0;
     int64_t keyRopeSrcStride = 0;
-    if constexpr (PAGE_ATTENTION) {
-        int64_t blkTableSrcStride =
-        ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
-        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize);
-        keySrcStride = blkTableSrcStride * constInfo.headDim * sizeof(KV_T);
-        keyRopeSrcStride = blkTableSrcStride * constInfo.headDimRope * sizeof(KV_T);
-    } else {
-        int64_t keyRopeOffset1 = GetKeyRopeGmOffset(realS2Idx1, runInfo, s2IdLimit);
-        int64_t keyRopeOffset2 = GetKeyRopeGmOffset(realS2Idx2, runInfo, s2IdLimit);
-        keySrcStride = ((keyOffset1 > keyOffset2 ? (keyOffset1 - keyOffset2) :
-                        (keyOffset2 - keyOffset1)) - constInfo.sparseBlockSize) * constInfo.headDim * sizeof(KV_T);
-        keyRopeSrcStride = ((keyRopeOffset1 > keyRopeOffset2 ? (keyRopeOffset1 - keyRopeOffset2) :
-                            (keyRopeOffset2 - keyRopeOffset1)) - constInfo.sparseBlockSize) *
-                             constInfo.headDimRope * sizeof(KV_T);
-    }
-    
-    if (unlikely(keySrcStride >= INT32_MAX || keySrcStride < 0 ||
-        (!PAGE_ATTENTION && (keyRopeSrcStride >= INT32_MAX || keyRopeSrcStride < 0)) ||
-        realS2Idx1 + constInfo.sparseBlockSize >= s2IdLimit ||
-        realS2Idx2 + constInfo.sparseBlockSize >= s2IdLimit)) {
+    bool usePairedCopy = CanUsePairedKvCopy(
+        realS2Idx1, realS2Idx2, keyOffset1, keyOffset2, s2IdLimit,
+        runInfo, keySrcStride, keyRopeSrcStride);
+    if (unlikely(!usePairedCopy)) {
         // stride溢出、stride为负数、s2超长等异常场景，还原�?条搬运指�?
-        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, s2IdLimit, runInfo);
-        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx1, keyOffset1, -1, s2IdLimit, runInfo);
+        CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, realS2Idx2, keyOffset2, -1, s2IdLimit, runInfo);
     } else {
         DataCopyExtParams intriParams;
         intriParams.blockLen = constInfo.sparseBlockSize * constInfo.headDim * sizeof(KV_T);
@@ -967,18 +1315,7 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
     int64_t logicalSparseOffset =
         static_cast<int64_t>(runInfo.s2Idx) * static_cast<int64_t>(constInfo.s2BaseSize) +
         s2StartGmOffset + mte3Size;
-    int64_t qTokenOffset = 0;
-    if constexpr (LAYOUT_T == FusedSparseAttentionOverlapLayout::TND) {
-        uint64_t actualSeqQPrefixSum =
-            (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(runInfo.bIdx - 1);
-        qTokenOffset = static_cast<int64_t>(actualSeqQPrefixSum) +
-                       static_cast<int64_t>(runInfo.gS1Idx / constInfo.gSize);
-    } else {
-        qTokenOffset = static_cast<int64_t>(runInfo.bIdx) * static_cast<int64_t>(constInfo.qSeqSize) +
-                       static_cast<int64_t>(runInfo.gS1Idx / constInfo.gSize);
-    }
-    int64_t selectionRow =
-        qTokenOffset * static_cast<int64_t>(constInfo.kvHeadNum) + static_cast<int64_t>(runInfo.n2Idx);
+    int64_t selectionRow = GetSelectionRow(runInfo);
 
     int64_t copiedCount = 0;
     while (copiedCount < tokenCount) {
@@ -1021,7 +1358,7 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
             DataCopyPad(selectionKRopeGm_[dstRopeAddr], srcRope, ropeParams);
         }
 
-        int64_t statusAddr = selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1) + topkPos;
+        int64_t statusAddr = selectionRow * selectionStatusStride_ + topkPos;
         for (int64_t idx = 0; idx < writeCount; idx++) {
             int32_t topkValue = topkGm_.GetValue(runInfo.topKBaseOffset + topkPos + idx);
             selectionKvBlockStatusGm_.SetValue(statusAddr + idx, topkValue);
@@ -1033,7 +1370,7 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
         int32_t actualSeq = static_cast<int32_t>(constInfo.sparseBlockCount);
         selectionKvActualSeqGm_.SetValue(selectionRow, actualSeq);
         selectionKvBlockStatusGm_.SetValue(
-            selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1) +
+            selectionRow * selectionStatusStride_ +
             static_cast<int64_t>(constInfo.sparseBlockCount),
             actualSeq);
     }
@@ -1054,8 +1391,40 @@ __aicore__ inline bool FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline bool FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::UsePipelineSelectionUpdate() const
 {
-    return enableSelectionUpdate_ && useAllCoreSelectionUpdate_ && constInfo.sparseBlockCount <= 1024 &&
-        selectionTopkBlockSize_ == 1 && constInfo.sparseBlockSize == 1;
+    return false;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::UseSetResidentSelection() const
+{
+    return enableSelectionUpdate_ && useAllCoreSelectionUpdate_ && PAGE_ATTENTION &&
+        TEMPLATE_MODE == V_TEMPLATE && selectionKvBlockSize_ > 0 && selectionMaxBlockNum_ > 0 &&
+        selectionTopkBlockSize_ == 1 && constInfo.sparseBlockSize == 1 &&
+        constInfo.sparseBlockCount > 0 && constInfo.sparseBlockCount <= SELECTION_MAX_TOPK &&
+        selectionStatusStride_ >= static_cast<int64_t>(constInfo.sparseBlockCount) + 1 &&
+        selectionMembershipStride_ >= SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::SnapshotSelectionSourceReadyAtEntry()
+{
+    constexpr int64_t statusElementsPerDataBlock = BYTE_BLOCK / sizeof(int32_t);
+    int64_t readyOffset = static_cast<int64_t>(constInfo.sparseBlockCount);
+    int64_t readyCopyStart = readyOffset / statusElementsPerDataBlock * statusElementsPerDataBlock;
+    DataCopyExtParams readyParams;
+    readyParams.blockCount = 1;
+    readyParams.blockLen = BYTE_BLOCK;
+    readyParams.srcStride = 0;
+    readyParams.dstStride = 0;
+    DataCopyPadExtParams<int32_t> readyPadParams{false, 0, 0, 0};
+    DataCopyPad(v0ValidSizeUb_, selectionKvBlockStatusGm_[readyCopyStart], readyParams, readyPadParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+    selectionSourceReadyAtEntry_ = enableSelectionUpdate_ &&
+        v0ValidSizeUb_.GetValue(readyOffset - readyCopyStart) ==
+            static_cast<int32_t>(constInfo.sparseBlockCount);
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
@@ -1123,9 +1492,11 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 
     int64_t selBlockOffset = topkPos % selectionKvBlockSize_;
     int64_t fullBlockOffset = static_cast<int64_t>(topkValue) % constInfo.kvCacheBlockSize;
-    int64_t srcTokenOffset = static_cast<int64_t>(fullBlockNum) * constInfo.kvCacheBlockSize *
-                                 static_cast<int64_t>(constInfo.kvHeadNum) +
-                             fullBlockOffset;
+    int64_t n2Idx = selectionRow % static_cast<int64_t>(constInfo.kvHeadNum);
+    int64_t srcTokenOffset =
+        (static_cast<int64_t>(fullBlockNum) * constInfo.kvCacheBlockSize + fullBlockOffset) *
+            static_cast<int64_t>(constInfo.kvHeadNum) +
+        n2Idx;
     int64_t dstKvAddr = static_cast<int64_t>(selBlockNum) * selectionKvBlockSize_ *
                             static_cast<int64_t>(constInfo.headDim) +
                         selBlockOffset * static_cast<int64_t>(constInfo.headDim);
@@ -1166,12 +1537,78 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::
+CopySelectionUpdateTokenFromSelectionCache(
+    int64_t selectionRow, int64_t destinationSlot, int64_t encodedSourceSlot)
+{
+    int64_t topkCount = static_cast<int64_t>(constInfo.sparseBlockCount);
+    int64_t sourceRow = encodedSourceSlot / topkCount;
+    int64_t sourceSlot = encodedSourceSlot - sourceRow * topkCount;
+    if (sourceRow < 0 || sourceSlot < 0 || sourceSlot >= topkCount ||
+        (sourceRow == selectionRow && sourceSlot == destinationSlot)) {
+        return;
+    }
+
+    int64_t sourceBlockTableIdx = sourceSlot / selectionKvBlockSize_;
+    int64_t destinationBlockTableIdx = destinationSlot / selectionKvBlockSize_;
+    int32_t sourceBlockNum = selectionKvBlockTableGm_.GetValue(
+        sourceRow * selectionMaxBlockNum_ + sourceBlockTableIdx);
+    int32_t destinationBlockNum = selectionKvBlockTableGm_.GetValue(
+        selectionRow * selectionMaxBlockNum_ + destinationBlockTableIdx);
+    if (sourceBlockNum < 0 || destinationBlockNum < 0) {
+        return;
+    }
+
+    int64_t sourceBlockOffset = sourceSlot % selectionKvBlockSize_;
+    int64_t destinationBlockOffset = destinationSlot % selectionKvBlockSize_;
+    int64_t sourceKvOffset =
+        (static_cast<int64_t>(sourceBlockNum) * selectionKvBlockSize_ + sourceBlockOffset) *
+        static_cast<int64_t>(constInfo.headDim);
+    int64_t destinationKvOffset =
+        (static_cast<int64_t>(destinationBlockNum) * selectionKvBlockSize_ + destinationBlockOffset) *
+        static_cast<int64_t>(constInfo.headDim);
+
+    DataCopyExtParams kvParams;
+    kvParams.blockCount = 1;
+    kvParams.blockLen = constInfo.headDim * sizeof(KV_T);
+    kvParams.srcStride = 0;
+    kvParams.dstStride = 0;
+    DataCopyPadExtParams<KV_T> padParams;
+    DataCopyPad(kvMergUb_, selectionKvCacheGm_[sourceKvOffset], kvParams, padParams);
+
+    DataCopyExtParams ropeParams;
+    ropeParams.blockCount = 1;
+    ropeParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+    ropeParams.srcStride = 0;
+    ropeParams.dstStride = 0;
+    if (constInfo.headDimRope > 0) {
+        int64_t sourceRopeOffset =
+            (static_cast<int64_t>(sourceBlockNum) * selectionKvBlockSize_ + sourceBlockOffset) *
+            static_cast<int64_t>(constInfo.headDimRope);
+        DataCopyPad(ropeMergUb_, selectionKRopeGm_[sourceRopeOffset], ropeParams, padParams);
+    }
+
+    SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+    DataCopyPad(selectionKvCacheGm_[destinationKvOffset], kvMergUb_, kvParams);
+    if (constInfo.headDimRope > 0) {
+        int64_t destinationRopeOffset =
+            (static_cast<int64_t>(destinationBlockNum) * selectionKvBlockSize_ + destinationBlockOffset) *
+            static_cast<int64_t>(constInfo.headDimRope);
+        DataCopyPad(selectionKRopeGm_[destinationRopeOffset], ropeMergUb_, ropeParams);
+    }
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::UpdateSelectionRange(
     int64_t selectionRow, uint32_t batchIdx, int64_t tokenStart, int64_t tokenEnd, int64_t s2IdLimit,
     bool appendActualSeq)
 {
     int64_t topkBase = selectionRow * static_cast<int64_t>(constInfo.sparseBlockCount);
-    int64_t statusBase = selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1);
+    int64_t statusBase = selectionRow * selectionStatusStride_;
     constexpr int64_t statusElementsPerDataBlock = BYTE_BLOCK / sizeof(int32_t);
     int64_t tokenCount = tokenEnd - tokenStart;
     int64_t statusStart = statusBase + tokenStart;
@@ -1232,36 +1669,945 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
-__aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::RunAllCoreSelectionUpdate()
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::GatherValidSelectionTopk(
+    LocalTensor<int32_t> currentTopkLocal, LocalTensor<int32_t> scratch0Local,
+    LocalTensor<uint32_t> scratch1Local, LocalTensor<uint32_t> scratch2Local,
+    int32_t maxValidTokenId, int32_t &validTopkNum)
 {
-    if (!enableSelectionUpdate_ || !useAllCoreSelectionUpdate_ || selectionKvBlockSize_ <= 0 ||
-        selectionMaxBlockNum_ <= 0 || selectionTopkBlockSize_ != 1 || constInfo.sparseBlockSize != 1) {
+    int64_t topkCount = static_cast<int64_t>(constInfo.sparseBlockCount);
+    int64_t topkBlockAlign = CeilDiv(topkCount, static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t))) *
+                             static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t));
+    int64_t compareNum = CeilDiv(topkBlockAlign, static_cast<int64_t>(SELECTION_COMPARE_SCALAR_NUM)) *
+                         static_cast<int64_t>(SELECTION_COMPARE_SCALAR_NUM);
+
+    LocalTensor<float> topkFloatLocal = scratch0Local.ReinterpretCast<float>();
+    Cast(topkFloatLocal, currentTopkLocal, RoundMode::CAST_ROUND, topkBlockAlign);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<uint8_t> lowerMaskLocal = scratch1Local.ReinterpretCast<uint8_t>();
+    CompareScalar(lowerMaskLocal, topkFloatLocal, -1.0f, CMPMODE::GT, compareNum);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<uint8_t> upperMaskLocal = scratch2Local.ReinterpretCast<uint8_t>();
+    CompareScalar(upperMaskLocal, topkFloatLocal, static_cast<float>(maxValidTokenId), CMPMODE::LE, compareNum);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<uint16_t> lowerMaskU16 = lowerMaskLocal.ReinterpretCast<uint16_t>();
+    LocalTensor<uint16_t> upperMaskU16 = upperMaskLocal.ReinterpretCast<uint16_t>();
+    And(lowerMaskU16, lowerMaskU16, upperMaskU16, compareNum / SELECTION_COMPARE_MASK_UNIT);
+    PipeBarrier<PIPE_V>();
+
+    uint64_t reservedCount = 0;
+    GatherMaskParams gatherMaskParams;
+    gatherMaskParams.repeatTimes = 1;
+    gatherMaskParams.src0BlockStride = 1;
+    gatherMaskParams.src0RepeatStride = 8;
+    gatherMaskParams.src1RepeatStride = 0;
+    LocalTensor<float> compactTopkFloat = currentTopkLocal.ReinterpretCast<float>();
+    LocalTensor<uint32_t> maskLocal = lowerMaskLocal.ReinterpretCast<uint32_t>();
+    GatherMask(compactTopkFloat, topkFloatLocal, maskLocal, true, topkBlockAlign,
+               gatherMaskParams, reservedCount);
+    PipeBarrier<PIPE_V>();
+    Cast(currentTopkLocal, compactTopkFloat, RoundMode::CAST_ROUND, topkBlockAlign);
+    PipeBarrier<PIPE_V>();
+    validTopkNum = static_cast<int32_t>(reservedCount);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::SortSelectionTopk(
+    LocalTensor<int32_t> sourceLocal, LocalTensor<uint32_t> indexLocal,
+    LocalTensor<float> tempLocal, LocalTensor<float> sortedLocal,
+    LocalTensor<int32_t> sortedTopkLocal, LocalTensor<uint32_t> sortedTopkIndexLocal,
+    int32_t validNum)
+{
+    int64_t sortAlign = CeilDiv(static_cast<int64_t>(constInfo.sparseBlockCount),
+                                static_cast<int64_t>(SELECTION_SORT_UNIT)) * SELECTION_SORT_UNIT;
+    LocalTensor<float> sourceFloatLocal = sourceLocal.ReinterpretCast<float>();
+    if (validNum > 0) {
+        Cast(sourceFloatLocal, sourceLocal, RoundMode::CAST_ROUND, validNum);
+        PipeBarrier<PIPE_V>();
+    }
+
+    int64_t duplicateNum = validNum % SELECTION_SORT_UNIT;
+    if (duplicateNum > 0) {
+        int64_t duplicateIndex = validNum - duplicateNum;
+        uint64_t mask0 = UINT64_MAX;
+        mask0 = mask0 << duplicateNum;
+        mask0 = mask0 & (UINT64_MAX >> SELECTION_SORT_UNIT);
+        uint64_t mask[2] = {mask0, 0};
+        Duplicate(sourceFloatLocal[duplicateIndex], -1.0f, mask, 1, 1, 8);
+        PipeBarrier<PIPE_V>();
+    }
+    int64_t duplicateStart = CeilDiv(static_cast<int64_t>(validNum),
+                                     static_cast<int64_t>(SELECTION_SORT_UNIT)) * SELECTION_SORT_UNIT;
+    if (duplicateStart < sortAlign) {
+        Duplicate(sourceFloatLocal[duplicateStart], -1.0f, sortAlign - duplicateStart);
+        PipeBarrier<PIPE_V>();
+    }
+
+    Concat(sourceFloatLocal, sourceFloatLocal, tempLocal, sortAlign / SELECTION_SORT_UNIT);
+    PipeBarrier<PIPE_V>();
+    Sort<float, true>(sortedLocal, sourceFloatLocal, indexLocal, tempLocal,
+                      sortAlign / SELECTION_SORT_UNIT);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<float> sortedTopkFloatLocal = sortedTopkLocal.ReinterpretCast<float>();
+    Extract(sortedTopkFloatLocal, sortedTopkIndexLocal, sortedLocal,
+            sortAlign / SELECTION_SORT_UNIT);
+    PipeBarrier<PIPE_V>();
+    Cast(sortedTopkLocal, sortedTopkFloatLocal, RoundMode::CAST_ROUND, sortAlign);
+    PipeBarrier<PIPE_V>();
+    Cast(sourceLocal, sourceFloatLocal, RoundMode::CAST_ROUND, sortAlign);
+    PipeBarrier<PIPE_V>();
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::FindSelectionTopkHit(
+    LocalTensor<int32_t> sortedTopkLocal, LocalTensor<uint32_t> sortedTopkIndexLocal,
+    LocalTensor<int32_t> sortedStatusLocal, LocalTensor<uint32_t> sortedStatusIndexLocal,
+    LocalTensor<int32_t> insertStatusLocal, LocalTensor<int32_t> hitSourceLocal,
+    int32_t validTopkNum, bool sameRow, int64_t sourceRow, int32_t &maxSameRowHitSlot)
+{
+    int32_t currentIdx = 0;
+    int32_t statusIdx = 0;
+    int32_t topkCount = static_cast<int32_t>(constInfo.sparseBlockCount);
+    while (currentIdx < validTopkNum && statusIdx < topkCount) {
+        int32_t currentToken = sortedTopkLocal.GetValue(currentIdx);
+        int32_t statusToken = sortedStatusLocal.GetValue(statusIdx);
+        if (currentToken < 0 || statusToken < 0) {
+            break;
+        }
+        if (currentToken == statusToken) {
+            int32_t currentPosition = static_cast<int32_t>(sortedTopkIndexLocal.GetValue(currentIdx));
+            int32_t statusSlot = static_cast<int32_t>(sortedStatusIndexLocal.GetValue(statusIdx));
+            if (sameRow) {
+                insertStatusLocal.SetValue(statusSlot, currentPosition);
+                hitSourceLocal.SetValue(
+                    currentPosition, SELECTION_PLAN_HIT_FLAG | statusSlot);
+                if (statusSlot > maxSameRowHitSlot) {
+                    maxSameRowHitSlot = statusSlot;
+                }
+            } else if (hitSourceLocal.GetValue(currentPosition) == -1) {
+                hitSourceLocal.SetValue(
+                    currentPosition, static_cast<int32_t>(sourceRow * topkCount + statusSlot));
+            }
+            currentIdx++;
+            statusIdx++;
+        } else if (currentToken > statusToken) {
+            currentIdx++;
+        } else {
+            statusIdx++;
+        }
+    }
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int32_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::BuildSetResidentSelectionPlan(
+    int64_t selectionRow, int64_t selectionGroupBaseRow, int64_t s2IdLimit,
+    LocalTensor<int32_t> currentTopkLocal, LocalTensor<int32_t> residentStatusLocal,
+    LocalTensor<int32_t> sourceStatusLocal, LocalTensor<uint32_t> indexLocal,
+    LocalTensor<int32_t> insertStatusLocal, LocalTensor<int32_t> hitSourceLocal,
+    LocalTensor<int32_t> sortBufferLocal)
+{
+    int64_t topkCount = static_cast<int64_t>(constInfo.sparseBlockCount);
+    int64_t sortAlign = CeilDiv(topkCount, static_cast<int64_t>(SELECTION_SORT_UNIT)) *
+                        static_cast<int64_t>(SELECTION_SORT_UNIT);
+    ArithProgression<int32_t>(indexLocal.ReinterpretCast<int32_t>(), 0, 1, sortAlign);
+    Duplicate(insertStatusLocal, -1, sortAlign);
+    Duplicate(hitSourceLocal, -1, sortAlign);
+    PipeBarrier<PIPE_V>();
+
+    LocalTensor<int32_t> sortedTopkLocal = sortBufferLocal;
+    LocalTensor<uint32_t> sortedTopkIndexLocal =
+        sortBufferLocal[sortAlign].ReinterpretCast<uint32_t>();
+    LocalTensor<int32_t> sortedStatusLocal = sortBufferLocal[sortAlign * 2];
+    LocalTensor<uint32_t> sortedStatusIndexLocal =
+        sortBufferLocal[sortAlign * 3].ReinterpretCast<uint32_t>();
+
+    int32_t validTopkNum = static_cast<int32_t>(topkCount);
+    if (s2IdLimit < topkCount) {
+        GatherValidSelectionTopk(
+            currentTopkLocal, sortedTopkLocal, sortedTopkIndexLocal, sortedStatusIndexLocal,
+            static_cast<int32_t>(s2IdLimit - 1), validTopkNum);
+    }
+
+    LocalTensor<float> tempLocal = sortedTopkLocal.ReinterpretCast<float>();
+    LocalTensor<float> sortedLocal = sortBufferLocal[sortAlign * 4].ReinterpretCast<float>();
+    SortSelectionTopk(currentTopkLocal, indexLocal, tempLocal, sortedLocal,
+                      sortedTopkLocal, sortedTopkIndexLocal, validTopkNum);
+
+    tempLocal = sortedStatusLocal.ReinterpretCast<float>();
+    SortSelectionTopk(residentStatusLocal, indexLocal, tempLocal, sortedLocal,
+                      sortedStatusLocal, sortedStatusIndexLocal,
+                      static_cast<int32_t>(topkCount));
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+
+    int32_t maxSameRowHitSlot = -1;
+    FindSelectionTopkHit(sortedTopkLocal, sortedTopkIndexLocal,
+                         sortedStatusLocal, sortedStatusIndexLocal,
+                         insertStatusLocal, hitSourceLocal, validTopkNum,
+                         true, selectionRow, maxSameRowHitSlot);
+
+    int64_t topkBlockAlign = CeilDiv(topkCount,
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t));
+    for (uint32_t sourceHead = 0; sourceHead < constInfo.kvHeadNum; sourceHead++) {
+        int64_t sourceRow = selectionGroupBaseRow + static_cast<int64_t>(sourceHead);
+        if (sourceRow == selectionRow) {
+            continue;
+        }
+        DataCopyExtParams statusParams;
+        statusParams.blockCount = 1;
+        statusParams.blockLen = static_cast<uint32_t>(topkCount * sizeof(int32_t));
+        statusParams.srcStride = 0;
+        statusParams.dstStride = 0;
+        DataCopyPadExtParams<int32_t> statusPadParams{
+            true, 0, static_cast<uint8_t>(topkBlockAlign - topkCount), -1};
+        DataCopyPad(sourceStatusLocal,
+            selectionKvBlockStatusGm_[sourceRow * selectionStatusStride_],
+            statusParams, statusPadParams);
+        SetFlag<AscendC::HardEvent::MTE2_S>(0);
+        WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+
+        tempLocal = sortedStatusLocal.ReinterpretCast<float>();
+        SortSelectionTopk(sourceStatusLocal, indexLocal, tempLocal, sortedLocal,
+                          sortedStatusLocal, sortedStatusIndexLocal,
+                          static_cast<int32_t>(topkCount));
+        SetFlag<AscendC::HardEvent::V_S>(0);
+        WaitFlag<AscendC::HardEvent::V_S>(0);
+        FindSelectionTopkHit(sortedTopkLocal, sortedTopkIndexLocal,
+                             sortedStatusLocal, sortedStatusIndexLocal,
+                             insertStatusLocal, hitSourceLocal, validTopkNum,
+                             false, sourceRow, maxSameRowHitSlot);
+    }
+
+    int32_t slotsToRelease = maxSameRowHitSlot + 1 - validTopkNum;
+    if (slotsToRelease > 0) {
+        int32_t scannedSlots = 0;
+        for (int32_t slot = maxSameRowHitSlot; slot >= 0 && scannedSlots < slotsToRelease;
+             slot--, scannedSlots++) {
+            int32_t currentPosition = insertStatusLocal.GetValue(slot);
+            if (currentPosition >= 0) {
+                hitSourceLocal.SetValue(
+                    currentPosition, static_cast<int32_t>(selectionRow * topkCount + slot));
+                insertStatusLocal.SetValue(slot, -1);
+            }
+        }
+    }
+    return validTopkNum;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsPositionResidentSelectionHit(
+    LocalTensor<int32_t> currentTopkLocal,
+    LocalTensor<int32_t> residentStatusLocal,
+    LocalTensor<int32_t> scratchLocal,
+    int32_t previousValidCount)
+{
+    int32_t topkCount = static_cast<int32_t>(constInfo.sparseBlockCount);
+    if (previousValidCount != topkCount) {
+        return false;
+    }
+
+    int32_t probeCount = topkCount < SELECTION_POSITION_PROBE_COUNT ?
+        topkCount : SELECTION_POSITION_PROBE_COUNT;
+    for (int32_t position = 0; position < probeCount; position++) {
+        if (currentTopkLocal.GetValue(position) != residentStatusLocal.GetValue(position)) {
+            return false;
+        }
+    }
+
+    int64_t topkBlockAlign = CeilDiv(static_cast<int64_t>(topkCount),
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t));
+    LocalTensor<float> currentTopkFloat = scratchLocal.ReinterpretCast<float>();
+    LocalTensor<float> residentStatusFloat = scratchLocal[topkBlockAlign].ReinterpretCast<float>();
+    LocalTensor<float> differenceFloat = scratchLocal[topkBlockAlign * 2].ReinterpretCast<float>();
+    LocalTensor<float> reduceWorkLocal = scratchLocal[topkBlockAlign * 3].ReinterpretCast<float>();
+
+    Cast(currentTopkFloat, currentTopkLocal, RoundMode::CAST_ROUND, topkCount);
+    Cast(residentStatusFloat, residentStatusLocal, RoundMode::CAST_ROUND, topkCount);
+    PipeBarrier<PIPE_V>();
+    Sub(differenceFloat, currentTopkFloat, residentStatusFloat, topkCount);
+    PipeBarrier<PIPE_V>();
+    Abs(differenceFloat, differenceFloat, topkCount);
+    PipeBarrier<PIPE_V>();
+    ReduceMax(currentTopkFloat, differenceFloat, reduceWorkLocal, topkCount);
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+    return currentTopkFloat.GetValue(0) == 0.0f;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsSelectionMembershipMapReady(
+    int64_t membershipBase, LocalTensor<int16_t> controlLocal)
+{
+    if (selectionMembershipStride_ < SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT) {
+        return false;
+    }
+
+    DataCopyExtParams controlParams;
+    controlParams.blockCount = 1;
+    controlParams.blockLen = SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT * sizeof(int16_t);
+    controlParams.srcStride = 0;
+    controlParams.dstStride = 0;
+    DataCopyPadExtParams<int16_t> controlPadParams{false, 0, 0, 0};
+    DataCopyPad(controlLocal,
+        selectionMembershipMapGm_[membershipBase +
+            SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT],
+        controlParams, controlPadParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+    return controlLocal.GetValue(0) == SELECTION_MEMBERSHIP_READY_MARKER;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::ClearSelectionUpdatePlanMarker(
+    int64_t membershipBase)
+{
+    selectionMembershipMapGm_.SetValue(
+        membershipBase + SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT + 1,
+        -1);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsTokenSetResidentSelectionHit(
+    LocalTensor<int32_t> currentTopkLocal,
+    LocalTensor<int16_t> membershipStorageLocal,
+    LocalTensor<uint32_t> membershipByteOffsetLocal,
+    LocalTensor<int16_t> gatheredMembershipLocal,
+    LocalTensor<int32_t> gatheredMembershipInt32Local,
+    int64_t membershipBase, int32_t previousValidCount, int64_t s2IdLimit,
+    bool &membershipSlotMapLoaded)
+{
+    membershipSlotMapLoaded = false;
+    int32_t topkCount = static_cast<int32_t>(constInfo.sparseBlockCount);
+    if (previousValidCount != topkCount || s2IdLimit < topkCount ||
+        s2IdLimit > SELECTION_MEMBERSHIP_MAX_TOKEN ||
+        selectionMembershipStride_ < SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT) {
+        return false;
+    }
+    if (!IsSelectionMembershipMapReady(
+            membershipBase,
+            membershipStorageLocal[SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT])) {
+        return false;
+    }
+
+    int64_t mapCopyIntCount = CeilDiv(
+        s2IdLimit, static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t));
+    DataCopyExtParams metadataParams;
+    metadataParams.blockCount = 1;
+    metadataParams.blockLen = static_cast<uint32_t>(mapCopyIntCount * sizeof(int16_t));
+    metadataParams.srcStride = 0;
+    metadataParams.dstStride = 0;
+    DataCopyPadExtParams<int16_t> metadataPadParams{false, 0, 0, 0};
+    DataCopyPad(membershipStorageLocal,
+        selectionMembershipMapGm_[membershipBase],
+        metadataParams, metadataPadParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+
+    Muls(membershipByteOffsetLocal.ReinterpretCast<int32_t>(), currentTopkLocal,
+        static_cast<int32_t>(sizeof(int16_t)), topkCount);
+    PipeBarrier<PIPE_V>();
+    Gather(gatheredMembershipLocal, membershipStorageLocal,
+        membershipByteOffsetLocal, 0, topkCount);
+    PipeBarrier<PIPE_V>();
+    membershipSlotMapLoaded = true;
+
+    int64_t topkBlockAlign = CeilDiv(
+        static_cast<int64_t>(topkCount),
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(half))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(half));
+    int64_t scratchOffset = mapCopyIntCount;
+    if (scratchOffset + topkBlockAlign * 2 +
+            static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t)) >
+        static_cast<int64_t>(ConstInfo::BUFFER_SIZE_BYTE_32K * 2 / sizeof(int16_t))) {
+        return false;
+    }
+    LocalTensor<half> gatheredHalfLocal =
+        membershipStorageLocal[scratchOffset].ReinterpretCast<half>();
+    LocalTensor<half> reduceResultLocal = gatheredHalfLocal[topkBlockAlign];
+    LocalTensor<half> reduceWorkLocal =
+        reduceResultLocal[BYTE_BLOCK / sizeof(half)];
+    Cast(gatheredHalfLocal, gatheredMembershipLocal, RoundMode::CAST_NONE, topkCount);
+    PipeBarrier<PIPE_V>();
+    ReduceMin(reduceResultLocal, gatheredHalfLocal, reduceWorkLocal, topkCount);
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+    bool allHit =
+        (reduceResultLocal.ReinterpretCast<uint16_t>().GetValue(0) & 0x8000U) == 0;
+    if (!allHit) {
+        Cast(gatheredMembershipInt32Local, gatheredHalfLocal,
+             RoundMode::CAST_RINT, topkCount);
+        PipeBarrier<PIPE_V>();
+    }
+    return allHit;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int16_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::EncodeSelectionPlanValue(
+    int32_t planValue) const
+{
+    if (planValue >= 0 && (planValue & SELECTION_PLAN_HIT_FLAG) != 0) {
+        return static_cast<int16_t>((planValue & SELECTION_PLAN_HIT_SLOT_MASK) + 1);
+    }
+    if (planValue >= 0 && (planValue & SELECTION_PLAN_UPDATE_FLAG) != 0) {
+        return static_cast<int16_t>(-((planValue & SELECTION_PLAN_SLOT_MASK) + 1));
+    }
+    return SELECTION_COMPACT_PLAN_INVALID;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsSelectionPlanHit(
+    int16_t planValue) const
+{
+    return planValue > 0;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline bool
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::IsSelectionPlanUpdate(
+    int16_t planValue) const
+{
+    return planValue < 0;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int32_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::DecodeSelectionPlanSlot(
+    int16_t planValue) const
+{
+    return planValue > 0 ? static_cast<int32_t>(planValue) - 1 :
+        -static_cast<int32_t>(planValue) - 1;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline int32_t
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::BuildDenseResidentSelectionPlan(
+    LocalTensor<int32_t> gatheredSlotLocal,
+    LocalTensor<int32_t> insertStatusLocal,
+    LocalTensor<int32_t> hitSourceLocal)
+{
+    int32_t topkCount = static_cast<int32_t>(constInfo.sparseBlockCount);
+    int64_t sortAlign = CeilDiv(
+        static_cast<int64_t>(topkCount), static_cast<int64_t>(SELECTION_SORT_UNIT)) *
+        static_cast<int64_t>(SELECTION_SORT_UNIT);
+    Duplicate(insertStatusLocal, -1, sortAlign);
+    Duplicate(hitSourceLocal, -1, sortAlign);
+    PipeBarrier<PIPE_V>();
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+
+    for (int32_t topkPosition = 0; topkPosition < topkCount; topkPosition++) {
+        int32_t slotPlusOne = gatheredSlotLocal.GetValue(topkPosition);
+        if (slotPlusOne <= 0 || slotPlusOne > topkCount) {
+            continue;
+        }
+        int32_t sourceSlot = slotPlusOne - 1;
+        insertStatusLocal.SetValue(sourceSlot, topkPosition);
+        hitSourceLocal.SetValue(
+            topkPosition, SELECTION_PLAN_HIT_FLAG | sourceSlot);
+    }
+    return topkCount;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::PublishTokenSetResidentSelectionMap(
+    LocalTensor<int32_t> residentStatusLocal,
+    LocalTensor<int16_t> membershipStorageLocal,
+    int64_t membershipBase, int32_t validTopkNum, int64_t s2IdLimit)
+{
+    if (selectionMembershipStride_ < SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT) {
         return;
     }
 
-    uint32_t aivCoreIdx = GetBlockIdx();
-    uint32_t aivCoreNum = GetBlockNum();
-    uint32_t updateStartCore = (aivCoreNum > 2) ? 2 : 0;
-    if (!UsePipelineSelectionUpdate() && aivCoreNum > 4) {
-        updateStartCore = 4;
-    }
-    if (aivCoreIdx < updateStartCore) {
+    if (s2IdLimit > SELECTION_MEMBERSHIP_MAX_TOKEN) {
+        LocalTensor<int16_t> compactControlLocal =
+            membershipStorageLocal[SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT];
+        Duplicate(compactControlLocal, static_cast<int16_t>(-1),
+                  SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT);
+        PipeBarrier<PIPE_V>();
+        SetFlag<AscendC::HardEvent::V_S>(0);
+        WaitFlag<AscendC::HardEvent::V_S>(0);
+        compactControlLocal.SetValue(0, SELECTION_MEMBERSHIP_READY_MARKER);
+        SetFlag<AscendC::HardEvent::S_MTE3>(0);
+        WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+
+        DataCopyExtParams controlParams;
+        controlParams.blockCount = 1;
+        controlParams.blockLen =
+            SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT * sizeof(int16_t);
+        controlParams.srcStride = 0;
+        controlParams.dstStride = 0;
+        DataCopyPad(selectionMembershipMapGm_[membershipBase +
+                        SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT],
+                    compactControlLocal, controlParams);
+        SetFlag<AscendC::HardEvent::MTE3_S>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_S>(0);
         return;
     }
-    uint32_t updateCoreIdx = aivCoreIdx - updateStartCore;
-    uint32_t updateCoreNum = aivCoreNum - updateStartCore;
-    if (updateCoreIdx >= updateCoreNum) {
+
+    Duplicate(membershipStorageLocal, static_cast<int16_t>(-1),
+              SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT);
+    PipeBarrier<PIPE_V>();
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+    for (int32_t selectionSlot = 0; selectionSlot < validTopkNum; selectionSlot++) {
+        int32_t tokenId = residentStatusLocal.GetValue(selectionSlot);
+        if (tokenId >= 0 && tokenId < SELECTION_MEMBERSHIP_MAX_TOKEN) {
+            membershipStorageLocal.SetValue(tokenId, selectionSlot + 1);
+        }
+    }
+    membershipStorageLocal.SetValue(
+        SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT,
+        SELECTION_MEMBERSHIP_READY_MARKER);
+    SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+
+    DataCopyExtParams metadataParams;
+    metadataParams.blockCount = 1;
+    metadataParams.blockLen =
+        SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT * sizeof(int16_t);
+    metadataParams.srcStride = 0;
+    metadataParams.dstStride = 0;
+    DataCopyPad(selectionMembershipMapGm_[membershipBase],
+                membershipStorageLocal, metadataParams);
+    SetFlag<AscendC::HardEvent::MTE3_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::WriteSelectionUpdatePlan(
+    int64_t membershipBase, int32_t planCount, int32_t selectionHitCount,
+    LocalTensor<int16_t> membershipStorageLocal, int64_t planOffset,
+    bool preserveMembershipMap)
+{
+    if (planCount <= 0 ||
+        selectionMembershipStride_ < SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT) {
         return;
     }
-    if (updateCoreNum == 0) {
+    LocalTensor<int16_t> controlLocal =
+        membershipStorageLocal[SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT];
+    Duplicate(controlLocal, static_cast<int16_t>(-1),
+              SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT);
+    PipeBarrier<PIPE_V>();
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+    controlLocal.SetValue(
+        0, preserveMembershipMap ? SELECTION_MEMBERSHIP_READY_MARKER : -1);
+    controlLocal.SetValue(1, SELECTION_PLAN_READY_MARKER);
+    controlLocal.SetValue(2, selectionHitCount);
+    controlLocal.SetValue(3, static_cast<int32_t>(planOffset));
+    controlLocal.SetValue(4, preserveMembershipMap ? 1 : 0);
+    SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+
+    DataCopyExtParams planParams;
+    planParams.blockCount = 1;
+    planParams.blockLen = static_cast<uint32_t>(
+        (planOffset + planCount) * sizeof(int16_t));
+    planParams.srcStride = 0;
+    planParams.dstStride = 0;
+    DataCopyPad(selectionMembershipMapGm_[membershipBase],
+                membershipStorageLocal, planParams);
+
+    DataCopyExtParams controlParams;
+    controlParams.blockCount = 1;
+    controlParams.blockLen =
+        SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT * sizeof(int16_t);
+    controlParams.srcStride = 0;
+    controlParams.dstStride = 0;
+    DataCopyPad(selectionMembershipMapGm_[membershipBase +
+                    SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT],
+                controlLocal, controlParams);
+    SetFlag<AscendC::HardEvent::MTE3_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::WriteSparseSelectionUpdatePlan(
+    int64_t membershipBase, int32_t updateCount,
+    LocalTensor<int16_t> membershipStorageLocal, int64_t planOffset)
+{
+    if (updateCount <= 0 || updateCount > SELECTION_SYNC_COPY_CAPACITY ||
+        planOffset < 0 ||
+        planOffset + SELECTION_SPARSE_PLAN_VALUE_COUNT >
+            SELECTION_MEMBERSHIP_MAP_INT16_COUNT) {
+        return;
+    }
+
+    LocalTensor<int16_t> controlLocal =
+        membershipStorageLocal[SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT];
+    Duplicate(controlLocal, static_cast<int16_t>(-1),
+              SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT);
+    PipeBarrier<PIPE_V>();
+    SetFlag<AscendC::HardEvent::V_S>(0);
+    WaitFlag<AscendC::HardEvent::V_S>(0);
+    controlLocal.SetValue(0, SELECTION_MEMBERSHIP_READY_MARKER);
+    controlLocal.SetValue(1, SELECTION_SPARSE_PLAN_READY_MARKER);
+    controlLocal.SetValue(2, updateCount);
+    controlLocal.SetValue(3, static_cast<int32_t>(planOffset));
+    controlLocal.SetValue(4, 1);
+
+    SetFlag<AscendC::HardEvent::S_MTE3>(0);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+
+    DataCopyExtParams planParams;
+    planParams.blockCount = 1;
+    planParams.blockLen =
+        SELECTION_SPARSE_PLAN_VALUE_COUNT * sizeof(int16_t);
+    planParams.srcStride = 0;
+    planParams.dstStride = 0;
+    DataCopyPad(selectionMembershipMapGm_[membershipBase + planOffset],
+                membershipStorageLocal[planOffset], planParams);
+
+    DataCopyExtParams controlParams;
+    controlParams.blockCount = 1;
+    controlParams.blockLen =
+        SELECTION_MEMBERSHIP_CONTROL_INT16_COUNT * sizeof(int16_t);
+    controlParams.srcStride = 0;
+    controlParams.dstStride = 0;
+    DataCopyPad(selectionMembershipMapGm_[membershipBase +
+                    SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT],
+                controlLocal, controlParams);
+    SetFlag<AscendC::HardEvent::MTE3_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::ProcessSetResidentSelectionRow(
+    int64_t selectionRow, uint32_t batchIdx, int64_t s2IdLimit)
+{
+    int64_t topkCount = static_cast<int64_t>(constInfo.sparseBlockCount);
+    int64_t sortAlign = CeilDiv(topkCount, static_cast<int64_t>(SELECTION_SORT_UNIT)) *
+                        static_cast<int64_t>(SELECTION_SORT_UNIT);
+    int64_t topkBlockAlign = CeilDiv(topkCount,
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t));
+    int64_t statusBlockAlign = CeilDiv(topkCount + 1,
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int32_t));
+    int64_t statusLocalStride = sortAlign > statusBlockAlign ? sortAlign : statusBlockAlign;
+
+    LocalTensor<int32_t> residentStatusLocal = tmpBuff1.Get<int32_t>();
+    LocalTensor<int32_t> sourceStatusLocal = residentStatusLocal[statusLocalStride];
+    LocalTensor<uint32_t> indexLocal = outputBuff1.Get<uint32_t>();
+    LocalTensor<int32_t> insertStatusLocal = outputBuff1.Get<int32_t>()[sortAlign];
+    LocalTensor<int32_t> hitSourceLocal = outputBuff1.Get<int32_t>()[sortAlign * 2];
+    LocalTensor<int32_t> currentTopkLocal = outputBuff1.Get<int32_t>()[sortAlign * 3];
+    LocalTensor<int32_t> sortBufferLocal = inputBuff1.Get<int32_t>();
+    LocalTensor<int16_t> membershipStorageLocal = inputBuff1.Get<int16_t>();
+    LocalTensor<int16_t> gatheredMembershipLocal =
+        tmpBuff1.Get<int16_t>()[statusLocalStride * 2 *
+                                sizeof(int32_t) / sizeof(int16_t)];
+    LocalTensor<int32_t> gatheredMembershipInt32Local =
+        tmpBuff1.Get<int32_t>()[statusLocalStride * 2 +
+            topkBlockAlign * sizeof(int16_t) / sizeof(int32_t)];
+    int64_t membershipBase = selectionRow * selectionMembershipStride_;
+
+    IsSelectionMembershipMapReady(membershipBase, gatheredMembershipLocal);
+    if (gatheredMembershipLocal.GetValue(1) ==
+        SELECTION_EXTERNAL_PLAN_READY_MARKER) {
+        selectionKvActualSeqGm_.SetValue(selectionRow, topkCount);
+        return;
+    }
+
+    DataCopyExtParams topkParams;
+    topkParams.blockCount = 1;
+    topkParams.blockLen = static_cast<uint32_t>(topkCount * sizeof(int32_t));
+    topkParams.srcStride = 0;
+    topkParams.dstStride = 0;
+    DataCopyPadExtParams<int32_t> topkPadParams{
+        true, 0, static_cast<uint8_t>(topkBlockAlign - topkCount), -1};
+    DataCopyPad(currentTopkLocal, topkGm_[selectionRow * topkCount],
+                topkParams, topkPadParams);
+
+    DataCopyExtParams statusParams;
+    statusParams.blockCount = 1;
+    statusParams.blockLen = static_cast<uint32_t>((topkCount + 1) * sizeof(int32_t));
+    statusParams.srcStride = 0;
+    statusParams.dstStride = 0;
+    DataCopyPadExtParams<int32_t> statusPadParams{
+        true, 0, static_cast<uint8_t>(statusBlockAlign - topkCount - 1), -1};
+    int64_t statusBase = selectionRow * selectionStatusStride_;
+    DataCopyPad(residentStatusLocal, selectionKvBlockStatusGm_[statusBase],
+                statusParams, statusPadParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(0);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(0);
+
+    int32_t previousValidCount = residentStatusLocal.GetValue(topkCount);
+    if (IsPositionResidentSelectionHit(
+            currentTopkLocal, residentStatusLocal, sortBufferLocal, previousValidCount)) {
+        if (!IsSelectionMembershipMapReady(membershipBase, gatheredMembershipLocal)) {
+            PublishTokenSetResidentSelectionMap(
+                residentStatusLocal, membershipStorageLocal, membershipBase,
+                previousValidCount, s2IdLimit);
+        } else {
+            ClearSelectionUpdatePlanMarker(membershipBase);
+        }
+        selectionKvActualSeqGm_.SetValue(selectionRow, previousValidCount);
+        return;
+    }
+    bool membershipSlotMapLoaded = false;
+    bool tokenSetResidentHit = IsTokenSetResidentSelectionHit(
+        currentTopkLocal, membershipStorageLocal, indexLocal,
+        gatheredMembershipLocal, gatheredMembershipInt32Local, membershipBase,
+        previousValidCount, s2IdLimit, membershipSlotMapLoaded);
+    if (tokenSetResidentHit) {
+        ClearSelectionUpdatePlanMarker(membershipBase);
+        selectionKvActualSeqGm_.SetValue(selectionRow, previousValidCount);
+        return;
+    }
+    int64_t activeMapCount = CeilDiv(
+        s2IdLimit, static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t))) *
+        static_cast<int64_t>(BYTE_BLOCK / sizeof(int16_t));
+    bool membershipMapLocalPreserved = membershipSlotMapLoaded &&
+        activeMapCount * static_cast<int64_t>(sizeof(int16_t)) +
+            topkBlockAlign * 4 * static_cast<int64_t>(sizeof(int32_t)) <=
+            static_cast<int64_t>(ConstInfo::BUFFER_SIZE_BYTE_32K * 2);
+    membershipMapLocalPreserved = membershipMapLocalPreserved &&
+        activeMapCount + topkCount <= SELECTION_MEMBERSHIP_MAP_INT16_COUNT;
+    int64_t selectionPlanLocalOffset =
+        membershipMapLocalPreserved ? activeMapCount : 0;
+    int64_t selectionGroupBaseRow =
+        selectionRow / static_cast<int64_t>(constInfo.kvHeadNum) *
+        static_cast<int64_t>(constInfo.kvHeadNum);
+    int32_t validTopkNum = membershipSlotMapLoaded ?
+        BuildDenseResidentSelectionPlan(
+            gatheredMembershipInt32Local, insertStatusLocal, hitSourceLocal) :
+        BuildSetResidentSelectionPlan(
+            selectionRow, selectionGroupBaseRow, s2IdLimit,
+            currentTopkLocal, residentStatusLocal, sourceStatusLocal,
+            indexLocal, insertStatusLocal, hitSourceLocal, sortBufferLocal);
+    LocalTensor<int16_t> compactPlanLocal =
+        membershipStorageLocal[selectionPlanLocalOffset];
+    bool compactPlanStarted = false;
+
+    bool statusDirty = previousValidCount != validTopkNum;
+    int32_t updateCount = 0;
+    int32_t selectionHitCount = 0;
+    int32_t smallUpdateTopkPosition[SELECTION_SYNC_COPY_CAPACITY];
+    int32_t smallUpdateDestination[SELECTION_SYNC_COPY_CAPACITY];
+    int32_t smallUpdateStaleToken[SELECTION_SYNC_COPY_CAPACITY];
+    int32_t nextInsertSlot = 0;
+    for (int32_t topkPosition = 0; topkPosition < validTopkNum; topkPosition++) {
+        int32_t planValue = hitSourceLocal.GetValue(topkPosition);
+        if (planValue >= 0 && (planValue & SELECTION_PLAN_HIT_FLAG) != 0) {
+            if (compactPlanStarted) {
+                compactPlanLocal.SetValue(
+                    topkPosition,
+                    static_cast<int16_t>((planValue & SELECTION_PLAN_HIT_SLOT_MASK) + 1));
+            }
+            selectionHitCount++;
+            continue;
+        }
+
+        int32_t destinationSlot = -1;
+        for (int32_t slot = nextInsertSlot; slot < static_cast<int32_t>(topkCount); slot++) {
+            if (insertStatusLocal.GetValue(slot) < 0) {
+                destinationSlot = slot;
+                break;
+            }
+        }
+        if (destinationSlot < 0) {
+            break;
+        }
+        nextInsertSlot = destinationSlot + 1;
+        if (updateCount < SELECTION_SYNC_COPY_CAPACITY) {
+            smallUpdateTopkPosition[updateCount] = topkPosition;
+            smallUpdateDestination[updateCount] = destinationSlot;
+            smallUpdateStaleToken[updateCount] = residentStatusLocal.GetValue(destinationSlot);
+        }
+        updateCount++;
+
+        int32_t tokenId = currentTopkLocal.GetValue(topkPosition);
+        int32_t staleToken = residentStatusLocal.GetValue(destinationSlot);
+        hitSourceLocal.SetValue(
+            topkPosition,
+            SELECTION_PLAN_UPDATE_FLAG | destinationSlot);
+        if (!compactPlanStarted && updateCount > SELECTION_SYNC_COPY_THRESHOLD) {
+            Duplicate(compactPlanLocal, SELECTION_COMPACT_PLAN_INVALID, topkCount);
+            PipeBarrier<PIPE_V>();
+            SetFlag<AscendC::HardEvent::V_S>(0);
+            WaitFlag<AscendC::HardEvent::V_S>(0);
+            for (int32_t planIdx = 0; planIdx <= topkPosition; planIdx++) {
+                compactPlanLocal.SetValue(
+                    planIdx,
+                    EncodeSelectionPlanValue(hitSourceLocal.GetValue(planIdx)));
+            }
+            compactPlanStarted = true;
+        } else if (compactPlanStarted) {
+            compactPlanLocal.SetValue(
+                topkPosition, static_cast<int16_t>(-(destinationSlot + 1)));
+        }
+        if (membershipMapLocalPreserved) {
+            if (staleToken >= 0 && staleToken < SELECTION_MEMBERSHIP_MAX_TOKEN) {
+                membershipStorageLocal.SetValue(staleToken, -1);
+            }
+            if (tokenId >= 0 && tokenId < SELECTION_MEMBERSHIP_MAX_TOKEN) {
+                membershipStorageLocal.SetValue(tokenId, destinationSlot + 1);
+            }
+        }
+        if (staleToken != tokenId) {
+            statusDirty = true;
+        }
+        residentStatusLocal.SetValue(destinationSlot, tokenId);
+    }
+
+    for (int32_t slot = validTopkNum; slot < static_cast<int32_t>(topkCount); slot++) {
+        if (residentStatusLocal.GetValue(slot) != -1) {
+            residentStatusLocal.SetValue(slot, -1);
+            statusDirty = true;
+        }
+    }
+    residentStatusLocal.SetValue(topkCount, validTopkNum);
+
+    bool useSparseSelectionUpdatePlan =
+        membershipMapLocalPreserved && previousValidCount == validTopkNum &&
+        validTopkNum == static_cast<int32_t>(topkCount) && updateCount > 0 &&
+        updateCount <= SELECTION_SYNC_COPY_CAPACITY;
+    if (useSparseSelectionUpdatePlan) {
+        for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+            int32_t topkPosition = smallUpdateTopkPosition[updateIdx];
+            int32_t tokenId = currentTopkLocal.GetValue(topkPosition);
+            if (tokenId < 0 || tokenId >= SELECTION_MEMBERSHIP_MAX_TOKEN) {
+                useSparseSelectionUpdatePlan = false;
+                break;
+            }
+        }
+    }
+    bool deferStatusWriteDrain =
+        statusDirty && (useSparseSelectionUpdatePlan ||
+                        updateCount > SELECTION_SYNC_COPY_THRESHOLD);
+    if (statusDirty) {
+        SetFlag<AscendC::HardEvent::S_MTE3>(0);
+        WaitFlag<AscendC::HardEvent::S_MTE3>(0);
+        DataCopyExtParams statusOutParams;
+        statusOutParams.blockCount = 1;
+        statusOutParams.blockLen = static_cast<uint32_t>((topkCount + 1) * sizeof(int32_t));
+        statusOutParams.srcStride = 0;
+        statusOutParams.dstStride = 0;
+        DataCopyPad(selectionKvBlockStatusGm_[statusBase], residentStatusLocal, statusOutParams);
+        if (!deferStatusWriteDrain) {
+            SetFlag<AscendC::HardEvent::MTE3_S>(0);
+            WaitFlag<AscendC::HardEvent::MTE3_S>(0);
+        }
+    }
+    if (useSparseSelectionUpdatePlan) {
+        Duplicate(compactPlanLocal, static_cast<int16_t>(0),
+                  SELECTION_SPARSE_PLAN_VALUE_COUNT);
+        PipeBarrier<PIPE_V>();
+        SetFlag<AscendC::HardEvent::V_S>(0);
+        WaitFlag<AscendC::HardEvent::V_S>(0);
+        for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+            int32_t topkPosition = smallUpdateTopkPosition[updateIdx];
+            int32_t destinationSlot = smallUpdateDestination[updateIdx];
+            int32_t tokenId = currentTopkLocal.GetValue(topkPosition);
+            compactPlanLocal.SetValue(updateIdx * 2,
+                                      static_cast<int16_t>(destinationSlot + 1));
+            compactPlanLocal.SetValue(updateIdx * 2 + 1,
+                                      static_cast<int16_t>(tokenId + 1));
+        }
+        for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+            int32_t staleToken = smallUpdateStaleToken[updateIdx];
+            if (staleToken >= 0 && staleToken < SELECTION_MEMBERSHIP_MAX_TOKEN) {
+                selectionMembershipMapGm_.SetValue(membershipBase + staleToken, -1);
+            }
+        }
+        for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+            int32_t topkPosition = smallUpdateTopkPosition[updateIdx];
+            int32_t tokenId = currentTopkLocal.GetValue(topkPosition);
+            int32_t destinationSlot = smallUpdateDestination[updateIdx];
+            selectionMembershipMapGm_.SetValue(
+                membershipBase + tokenId, destinationSlot + 1);
+        }
+        WriteSparseSelectionUpdatePlan(
+            membershipBase, updateCount, membershipStorageLocal,
+            selectionPlanLocalOffset);
+    } else if (updateCount <= SELECTION_SYNC_COPY_THRESHOLD) {
+        for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+            int32_t topkPosition = smallUpdateTopkPosition[updateIdx];
+            int32_t destinationSlot = smallUpdateDestination[updateIdx];
+            int32_t tokenId = currentTopkLocal.GetValue(topkPosition);
+            CopySelectionUpdateTokenFromFullCache(
+                selectionRow, batchIdx, destinationSlot, tokenId, s2IdLimit);
+        }
+        if (updateCount > 0) {
+            SetFlag<AscendC::HardEvent::MTE3_V>(0);
+            WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+        }
+        if (membershipMapLocalPreserved) {
+            for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+                int32_t staleToken = smallUpdateStaleToken[updateIdx];
+                if (staleToken >= 0 && staleToken < SELECTION_MEMBERSHIP_MAX_TOKEN) {
+                    selectionMembershipMapGm_.SetValue(membershipBase + staleToken, -1);
+                }
+            }
+            for (int32_t updateIdx = 0; updateIdx < updateCount; updateIdx++) {
+                int32_t topkPosition = smallUpdateTopkPosition[updateIdx];
+                int32_t tokenId = currentTopkLocal.GetValue(topkPosition);
+                int32_t destinationSlot = smallUpdateDestination[updateIdx];
+                if (tokenId >= 0 && tokenId < SELECTION_MEMBERSHIP_MAX_TOKEN) {
+                    selectionMembershipMapGm_.SetValue(
+                        membershipBase + tokenId, destinationSlot + 1);
+                }
+            }
+            ClearSelectionUpdatePlanMarker(membershipBase);
+        } else {
+            PublishTokenSetResidentSelectionMap(
+                residentStatusLocal, membershipStorageLocal, membershipBase,
+                validTopkNum, s2IdLimit);
+        }
+    } else {
+        WriteSelectionUpdatePlan(
+            membershipBase, static_cast<int32_t>(topkCount), selectionHitCount,
+            membershipStorageLocal, selectionPlanLocalOffset,
+            membershipMapLocalPreserved);
+    }
+    selectionKvActualSeqGm_.SetValue(selectionRow, validTopkNum);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::RunAllCoreSelectionUpdate()
+{
+    if (!UseSetResidentSelection()) {
+        return;
+    }
+
+    uint32_t workerCount = GetBlockNum();
+    uint32_t workerIdx = (GetBlockIdx() / 2) * 2 + GetSubBlockIdx();
+    if (workerCount == 0 || workerIdx >= workerCount) {
         return;
     }
 
     int64_t qTokenPrefix = 0;
+    int64_t selectionGroupIdx = 0;
     for (uint32_t batchIdx = 0; batchIdx < constInfo.batchSize; batchIdx++) {
         uint64_t actualQSeqLen = GetActualQSeqLenForSelectionUpdate(batchIdx);
         uint64_t actualKVSeqLen = GetActualKVSeqLenForSelectionUpdate(batchIdx);
         for (uint64_t qIdx = 0; qIdx < actualQSeqLen; qIdx++) {
+            if (selectionGroupIdx % static_cast<int64_t>(workerCount) != workerIdx) {
+                selectionGroupIdx++;
+                continue;
+            }
             int64_t s2IdLimit = static_cast<int64_t>(actualKVSeqLen);
             if (constInfo.sparseMode == 3) {
                 s2IdLimit = static_cast<int64_t>(actualKVSeqLen) - static_cast<int64_t>(actualQSeqLen) +
@@ -1270,76 +2616,36 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
             if (s2IdLimit < 0) {
                 s2IdLimit = 0;
             }
-            for (uint32_t n2Idx = 0; n2Idx < constInfo.kvHeadNum; n2Idx++) {
-                int64_t selectionRow =
-                    (qTokenPrefix + static_cast<int64_t>(qIdx)) * static_cast<int64_t>(constInfo.kvHeadNum) +
-                    static_cast<int64_t>(n2Idx);
-                int64_t statusBase = selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1);
-                constexpr int64_t statusElementsPerDataBlock = BYTE_BLOCK / sizeof(int32_t);
-                int64_t statusMisalignment = statusBase % statusElementsPerDataBlock;
-                int64_t prefixCount =
-                    statusMisalignment == 0 ? 0 : statusElementsPerDataBlock - statusMisalignment;
-                if (prefixCount > static_cast<int64_t>(constInfo.sparseBlockCount)) {
-                    prefixCount = static_cast<int64_t>(constInfo.sparseBlockCount);
-                }
-                int64_t middleTokenCount = static_cast<int64_t>(constInfo.sparseBlockCount) - prefixCount;
-                middleTokenCount = middleTokenCount / statusElementsPerDataBlock * statusElementsPerDataBlock;
-                int64_t middleBlockCount = middleTokenCount / statusElementsPerDataBlock;
-                int64_t middleBlocksPerCore =
-                    CeilDiv(middleBlockCount, static_cast<int64_t>(updateCoreNum));
-                int64_t middleBlockStart = static_cast<int64_t>(updateCoreIdx) * middleBlocksPerCore;
-                int64_t middleBlockEnd = middleBlockStart + middleBlocksPerCore;
-                if (middleBlockEnd > middleBlockCount) {
-                    middleBlockEnd = middleBlockCount;
-                }
-
-                if (updateCoreIdx == 0 && prefixCount > 0) {
-                    UpdateSelectionRange(selectionRow, batchIdx, 0, prefixCount, s2IdLimit);
-                }
-                int64_t middleTokenStart = prefixCount + middleBlockStart * statusElementsPerDataBlock;
-                int64_t middleTokenEnd = prefixCount + middleBlockEnd * statusElementsPerDataBlock;
-                if (middleTokenStart < middleTokenEnd) {
-                    UpdateSelectionRange(
-                        selectionRow, batchIdx, middleTokenStart, middleTokenEnd, s2IdLimit);
-                }
-                if (updateCoreIdx == 0) {
-                    int64_t suffixStart = prefixCount + middleTokenCount;
-                    UpdateSelectionRange(selectionRow, batchIdx, suffixStart,
-                        static_cast<int64_t>(constInfo.sparseBlockCount), s2IdLimit, true);
-                    int32_t actualSeq = static_cast<int32_t>(constInfo.sparseBlockCount);
-                    selectionKvActualSeqGm_.SetValue(selectionRow, actualSeq);
-                }
+            int64_t qTokenIdx = 0;
+            if constexpr (LAYOUT_T == FusedSparseAttentionOverlapLayout::TND) {
+                qTokenIdx = qTokenPrefix + static_cast<int64_t>(qIdx);
+            } else {
+                qTokenIdx = static_cast<int64_t>(batchIdx) * constInfo.qSeqSize +
+                            static_cast<int64_t>(qIdx);
             }
+            int64_t selectionGroupBaseRow =
+                qTokenIdx * static_cast<int64_t>(constInfo.kvHeadNum);
+            for (uint32_t n2Idx = 0; n2Idx < constInfo.kvHeadNum; n2Idx++) {
+                ProcessSetResidentSelectionRow(
+                    selectionGroupBaseRow + static_cast<int64_t>(n2Idx), batchIdx, s2IdLimit);
+            }
+            selectionGroupIdx++;
         }
         qTokenPrefix += static_cast<int64_t>(actualQSeqLen);
     }
-    pipe_barrier(PIPE_ALL);
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
-__aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyOutSelectionUpdateFromKvMerge(const RunInfo &runInfo)
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::
+CopyOutSparseSelectionUpdateFromKvMerge(const RunInfo &runInfo)
 {
-    if (!enableSelectionUpdate_ || selectionKvBlockSize_ <= 0 || selectionMaxBlockNum_ <= 0 ||
-        selectionTopkBlockSize_ != 1 || constInfo.sparseBlockSize != 1) {
-        return;
-    }
-    if (useAllCoreSelectionUpdate_ && constInfo.sparseBlockCount > 1024) {
+    if (!selectionSparseUpdatePlanActive_ || selectionUpdatePlanCount_ <= 0 ||
+        selectionUpdatePlanCount_ > SELECTION_SYNC_COPY_CAPACITY) {
         return;
     }
 
-    int64_t qTokenOffset = 0;
-    if constexpr (LAYOUT_T == FusedSparseAttentionOverlapLayout::TND) {
-        uint64_t actualSeqQPrefixSum =
-            (runInfo.bIdx <= 0) ? 0 : actualSeqLengthsQGm.GetValue(runInfo.bIdx - 1);
-        qTokenOffset = static_cast<int64_t>(actualSeqQPrefixSum) +
-                       static_cast<int64_t>(runInfo.gS1Idx / constInfo.gSize);
-    } else {
-        qTokenOffset = static_cast<int64_t>(runInfo.bIdx) * static_cast<int64_t>(constInfo.qSeqSize) +
-                       static_cast<int64_t>(runInfo.gS1Idx / constInfo.gSize);
-    }
-    int64_t selectionRow =
-        qTokenOffset * static_cast<int64_t>(constInfo.kvHeadNum) + static_cast<int64_t>(runInfo.n2Idx);
-
+    int64_t selectionRow = GetSelectionRow(runInfo);
     int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
     int64_t s2GmStartOffset = GetSubBlockIdx() == 0 ? 0 :
@@ -1349,72 +2655,219 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
     if (s2GmLimit > s2ProcessSize) {
         s2GmLimit = s2ProcessSize;
     }
+    if (s2GmStartOffset >= s2GmLimit) {
+        return;
+    }
+
+    int64_t physicalSlotBase =
+        static_cast<int64_t>(runInfo.s2Idx) * static_cast<int64_t>(constInfo.s2BaseSize);
+    int64_t rangeStart = physicalSlotBase + s2GmStartOffset;
+    int64_t rangeLimit = physicalSlotBase + s2GmLimit;
+    LocalTensor<int16_t> sparsePlanLocal =
+        v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET *
+            sizeof(int32_t) / sizeof(int16_t)];
+
+    int32_t updateIdx = 0;
+    while (updateIdx < selectionUpdatePlanCount_) {
+        int32_t destinationSlot =
+            static_cast<int32_t>(sparsePlanLocal.GetValue(updateIdx * 2)) - 1;
+        if (destinationSlot < rangeStart) {
+            updateIdx++;
+            continue;
+        }
+        if (destinationSlot >= rangeLimit) {
+            break;
+        }
+
+        int64_t destinationBlockTableIdx =
+            static_cast<int64_t>(destinationSlot) / selectionKvBlockSize_;
+        int64_t destinationBlockOffset =
+            static_cast<int64_t>(destinationSlot) % selectionKvBlockSize_;
+        int64_t runLen = 1;
+        while (updateIdx + runLen < selectionUpdatePlanCount_ &&
+               runLen < SELECTION_SYNC_COPY_CAPACITY &&
+               destinationBlockOffset + runLen < selectionKvBlockSize_) {
+            int32_t nextDestinationSlot = static_cast<int32_t>(
+                sparsePlanLocal.GetValue((updateIdx + runLen) * 2)) - 1;
+            if (nextDestinationSlot != destinationSlot + runLen ||
+                nextDestinationSlot >= rangeLimit) {
+                break;
+            }
+            runLen++;
+        }
+
+        int32_t destinationBlockNum = selectionKvBlockTableGm_.GetValue(
+            selectionRow * selectionMaxBlockNum_ + destinationBlockTableIdx);
+        if (destinationBlockNum >= 0) {
+            int64_t sourceOffset =
+                static_cast<int64_t>(destinationSlot) - physicalSlotBase;
+            DataCopyExtParams kvParams;
+            kvParams.blockCount = static_cast<uint32_t>(runLen);
+            kvParams.blockLen = constInfo.headDim * sizeof(KV_T);
+            kvParams.srcStride = 0;
+            kvParams.dstStride = 0;
+            DataCopyPadExtParams<KV_T> padParams;
+            DataCopyPad(kvMergUb_,
+                kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                           sourceOffset * static_cast<int64_t>(constInfo.headDim)],
+                kvParams, padParams);
+
+            DataCopyExtParams ropeParams;
+            ropeParams.blockCount = static_cast<uint32_t>(runLen);
+            ropeParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+            ropeParams.srcStride = 0;
+            ropeParams.dstStride = 0;
+            if (constInfo.headDimRope > 0) {
+                DataCopyPad(ropeMergUb_,
+                    kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                               512 * static_cast<int64_t>(constInfo.headDim) +
+                               sourceOffset * static_cast<int64_t>(constInfo.headDimRope)],
+                    ropeParams, padParams);
+            }
+            SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+            WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
+
+            int64_t destinationKvOffset =
+                (static_cast<int64_t>(destinationBlockNum) * selectionKvBlockSize_ +
+                 destinationBlockOffset) * static_cast<int64_t>(constInfo.headDim);
+            DataCopyPad(selectionKvCacheGm_[destinationKvOffset], kvMergUb_, kvParams);
+            if (constInfo.headDimRope > 0) {
+                int64_t destinationRopeOffset =
+                    (static_cast<int64_t>(destinationBlockNum) * selectionKvBlockSize_ +
+                     destinationBlockOffset) *
+                    static_cast<int64_t>(constInfo.headDimRope);
+                DataCopyPad(selectionKRopeGm_[destinationRopeOffset],
+                            ropeMergUb_, ropeParams);
+            }
+            SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+            WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+        }
+        updateIdx += static_cast<int32_t>(runLen);
+    }
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::CopyOutSelectionUpdateFromKvMerge(const RunInfo &runInfo)
+{
+    if (!selectionUpdatePlanActive_ || !UseSetResidentSelection()) {
+        return;
+    }
+    if (selectionSparseUpdatePlanActive_) {
+        CopyOutSparseSelectionUpdateFromKvMerge(runInfo);
+        return;
+    }
+
+    int64_t logicalSelectionRow = GetSelectionRow(runInfo);
+    int64_t selectionRow = selectionDataRow_ >= 0 ?
+        selectionDataRow_ : logicalSelectionRow;
+    int64_t membershipBase = logicalSelectionRow * selectionMembershipStride_;
+    int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
+    int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
+    int64_t s2GmStartOffset = GetSubBlockIdx() == 0 ? 0 :
+        CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize;
+    int64_t s2GmLimit = GetSubBlockIdx() == 0 ?
+        CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize : s2ProcessSize;
+    if (s2GmLimit > s2ProcessSize) {
+        s2GmLimit = s2ProcessSize;
+    }
+    if (s2GmStartOffset >= s2GmLimit) {
+        return;
+    }
+
+    int64_t logicalPlanStart =
+        static_cast<int64_t>(runInfo.s2Idx) * static_cast<int64_t>(constInfo.s2BaseSize) +
+        s2GmStartOffset;
+    int64_t planCount = s2GmLimit - s2GmStartOffset;
+    LocalTensor<int16_t> planLocal =
+        v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET * sizeof(int32_t) / sizeof(int16_t)];
+    LocalTensor<uint32_t> packedPlanLocal = planLocal.ReinterpretCast<uint32_t>();
+    DataCopyExtParams planParams;
+    planParams.blockCount = 1;
+    planParams.blockLen = static_cast<uint32_t>(planCount * sizeof(int16_t));
+    planParams.srcStride = 0;
+    planParams.dstStride = 0;
+    DataCopyPadExtParams<int16_t> planPadParams{false, 0, 0, 0};
+    DataCopyPad(planLocal,
+        selectionMembershipMapGm_[membershipBase + selectionUpdatePlanOffset_ + logicalPlanStart],
+        planParams, planPadParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(1);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(1);
 
     int64_t localOffset = s2GmStartOffset;
     while (localOffset < s2GmLimit) {
-        int64_t topkPos = static_cast<int64_t>(runInfo.s2Idx) * static_cast<int64_t>(constInfo.s2BaseSize) +
-                          localOffset;
-        int64_t selBlockTableIdx = topkPos / selectionKvBlockSize_;
-        int64_t selBlockOffset = topkPos % selectionKvBlockSize_;
         int64_t writeCount = s2GmLimit - localOffset;
         if (writeCount > 32) {
             writeCount = 32;
         }
-        int64_t remainingInBlock = selectionKvBlockSize_ - selBlockOffset;
-        if (writeCount > remainingInBlock) {
-            writeCount = remainingInBlock;
-        }
-
-        int64_t statusAddr = selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1) + topkPos;
-        int64_t missDstIdx[32];
-        int64_t missSrcIdx[32];
-        int64_t missCount = 0;
-        bool statusDirty = false;
+        int64_t updateDstSlot[32];
+        int64_t updateSrcIdx[32];
+        int64_t updateCount = 0;
         int64_t s2IdLimit = runInfo.curActualSeqLenOri;
         if (constInfo.sparseMode == 3) {
             s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size +
                         runInfo.gS1Idx / constInfo.gSize + 1;
         }
-        int64_t statusBase = selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1);
+        int64_t cachedPackedPlanIdx = -1;
+        uint32_t cachedPackedPlanValue = 0;
         for (int64_t idx = 0; idx < writeCount; idx++) {
-            int32_t topkValue = topkGm_.GetValue(runInfo.topKBaseOffset + topkPos + idx);
-            int32_t currentStatus = selectionKvBlockStatusGm_.GetValue(statusAddr + idx);
-            if (currentStatus == topkValue) {
+            int64_t planIdx = localOffset - s2GmStartOffset + idx;
+            int64_t packedPlanIdx = planIdx / 2;
+            if (packedPlanIdx != cachedPackedPlanIdx) {
+                cachedPackedPlanValue = packedPlanLocal.GetValue(packedPlanIdx);
+                cachedPackedPlanIdx = packedPlanIdx;
+            }
+            int16_t planValue = (planIdx & 1) == 0 ?
+                static_cast<int16_t>(cachedPackedPlanValue & 0xFFFFU) :
+                static_cast<int16_t>(cachedPackedPlanValue >> 16);
+            if (!IsSelectionPlanUpdate(planValue)) {
                 continue;
             }
-            statusDirty = true;
-            if (topkValue < 0) {
-                continue;
-            }
+            int32_t destinationSlot = DecodeSelectionPlanSlot(planValue);
             int64_t srcIdx = idx;
             int64_t absoluteOffset = localOffset + idx;
             int64_t pairSize = 2L * static_cast<int64_t>(constInfo.sparseBlockSize);
             int64_t pairOffset = (absoluteOffset / pairSize) * pairSize;
             if (constInfo.sparseBlockSize == 1 && pairOffset + 1 < s2ProcessSize) {
+                bool pairHasSelectionHit = false;
+                int64_t pairPlanIdx = pairOffset - s2GmStartOffset;
+                if (pairPlanIdx >= 0 && pairPlanIdx + 1 < planCount) {
+                    int64_t pairPackedPlanIdx = pairPlanIdx / 2;
+                    uint32_t pairPackedPlanValue =
+                        pairPackedPlanIdx == cachedPackedPlanIdx ?
+                            cachedPackedPlanValue :
+                            packedPlanLocal.GetValue(pairPackedPlanIdx);
+                    int16_t pairPlan0 =
+                        static_cast<int16_t>(pairPackedPlanValue & 0xFFFFU);
+                    int16_t pairPlan1 =
+                        static_cast<int16_t>(pairPackedPlanValue >> 16);
+                    pairHasSelectionHit = IsSelectionPlanHit(pairPlan0) ||
+                        IsSelectionPlanHit(pairPlan1);
+                }
                 int64_t realS2Idx0 = -1;
                 int64_t realS2Idx1 = -1;
                 GetRealS2Idx(pairOffset, realS2Idx0, runInfo.topKBaseOffset, runInfo);
                 GetRealS2Idx(pairOffset + 1, realS2Idx1, runInfo.topKBaseOffset, runInfo);
                 int64_t keyOffset0 = GetKeyGmOffset(realS2Idx0, runInfo, s2IdLimit);
                 int64_t keyOffset1 = GetKeyGmOffset(realS2Idx1, runInfo, s2IdLimit);
-                if (keyOffset0 >= 0 && keyOffset1 >= 0 && keyOffset1 < keyOffset0) {
+                int64_t keySrcStride = 0;
+                int64_t keyRopeSrcStride = 0;
+                bool usedPairedCopy = !pairHasSelectionHit && keyOffset0 >= 0 && keyOffset1 >= 0 &&
+                    CanUsePairedKvCopy(
+                        realS2Idx0, realS2Idx1, keyOffset0, keyOffset1, s2IdLimit,
+                        runInfo, keySrcStride, keyRopeSrcStride);
+                if (usedPairedCopy && keyOffset1 < keyOffset0) {
                     int64_t srcAbsoluteOffset = (absoluteOffset == pairOffset) ? pairOffset + 1 : pairOffset;
                     if (srcAbsoluteOffset >= localOffset && srcAbsoluteOffset < localOffset + writeCount) {
                         srcIdx = srcAbsoluteOffset - localOffset;
                     }
                 }
             }
-            missDstIdx[missCount] = idx;
-            missSrcIdx[missCount] = srcIdx;
-            missCount++;
+            updateDstSlot[updateCount] = destinationSlot;
+            updateSrcIdx[updateCount] = srcIdx;
+            updateCount++;
         }
 
-        int32_t selBlockNum = -1;
-        if (missCount > 0) {
-            selBlockNum = selectionKvBlockTableGm_.GetValue(
-                selectionRow * selectionMaxBlockNum_ + selBlockTableIdx);
-        }
-        if (selBlockNum >= 0 && missCount > 0) {
+        if (updateCount > 0) {
             DataCopyExtParams kvParams;
             kvParams.blockLen = constInfo.headDim * sizeof(KV_T);
             kvParams.srcStride = 0;
@@ -1439,69 +2892,438 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
                 ropeParams, padParams);
             SetFlag<AscendC::HardEvent::MTE2_MTE3>(0);
             WaitFlag<AscendC::HardEvent::MTE2_MTE3>(0);
-            int64_t missIdx = 0;
-            while (missIdx < missCount) {
-                int64_t dstStart = missDstIdx[missIdx];
-                int64_t srcStart = missSrcIdx[missIdx];
+            int64_t updateIdx = 0;
+            while (updateIdx < updateCount) {
+                int64_t destinationSlot = updateDstSlot[updateIdx];
+                int64_t destinationBlockTableIdx = destinationSlot / selectionKvBlockSize_;
+                int64_t destinationBlockOffset = destinationSlot % selectionKvBlockSize_;
+                int32_t destinationBlockNum = selectionKvBlockTableGm_.GetValue(
+                    selectionRow * selectionMaxBlockNum_ + destinationBlockTableIdx);
+                int64_t srcStart = updateSrcIdx[updateIdx];
                 int64_t runLen = 1;
-                while (missIdx + runLen < missCount &&
-                       missDstIdx[missIdx + runLen] == dstStart + runLen &&
-                       missSrcIdx[missIdx + runLen] == srcStart + runLen) {
+                while (updateIdx + runLen < updateCount &&
+                       updateDstSlot[updateIdx + runLen] == destinationSlot + runLen &&
+                       updateSrcIdx[updateIdx + runLen] == srcStart + runLen &&
+                       destinationBlockOffset + runLen < selectionKvBlockSize_) {
                     runLen++;
                 }
-                DataCopyExtParams missKvParams = kvParams;
-                missKvParams.blockCount = runLen;
-                int64_t dstKvAddr = static_cast<int64_t>(selBlockNum) * selectionKvBlockSize_ *
-                                        static_cast<int64_t>(constInfo.headDim) +
-                                    (selBlockOffset + dstStart) * static_cast<int64_t>(constInfo.headDim);
-                DataCopyPad(selectionKvCacheGm_[dstKvAddr],
-                    kvMergUb_[srcStart * static_cast<int64_t>(constInfo.headDim)], missKvParams);
-                missIdx += runLen;
-            }
+                if (destinationBlockNum >= 0) {
+                    DataCopyExtParams updateKvParams = kvParams;
+                    updateKvParams.blockCount = runLen;
+                    int64_t dstKvAddr =
+                        (static_cast<int64_t>(destinationBlockNum) * selectionKvBlockSize_ +
+                         destinationBlockOffset) * static_cast<int64_t>(constInfo.headDim);
+                    DataCopyPad(selectionKvCacheGm_[dstKvAddr],
+                        kvMergUb_[srcStart * static_cast<int64_t>(constInfo.headDim)],
+                        updateKvParams);
 
-            missIdx = 0;
-            while (missIdx < missCount) {
-                int64_t dstStart = missDstIdx[missIdx];
-                int64_t srcStart = missSrcIdx[missIdx];
-                int64_t runLen = 1;
-                while (missIdx + runLen < missCount &&
-                       missDstIdx[missIdx + runLen] == dstStart + runLen &&
-                       missSrcIdx[missIdx + runLen] == srcStart + runLen) {
-                    runLen++;
+                    if (constInfo.headDimRope > 0) {
+                        DataCopyExtParams updateRopeParams = ropeParams;
+                        updateRopeParams.blockCount = runLen;
+                        int64_t dstRopeAddr =
+                            (static_cast<int64_t>(destinationBlockNum) * selectionKvBlockSize_ +
+                             destinationBlockOffset) *
+                            static_cast<int64_t>(constInfo.headDimRope);
+                        DataCopyPad(selectionKRopeGm_[dstRopeAddr],
+                            ropeMergUb_[srcStart * static_cast<int64_t>(constInfo.headDimRope)],
+                            updateRopeParams);
+                    }
                 }
-                DataCopyExtParams missRopeParams = ropeParams;
-                missRopeParams.blockCount = runLen;
-                int64_t dstRopeAddr = static_cast<int64_t>(selBlockNum) * selectionKvBlockSize_ *
-                                          static_cast<int64_t>(constInfo.headDimRope) +
-                                      (selBlockOffset + dstStart) *
-                                          static_cast<int64_t>(constInfo.headDimRope);
-                DataCopyPad(selectionKRopeGm_[dstRopeAddr],
-                    ropeMergUb_[srcStart * static_cast<int64_t>(constInfo.headDimRope)], missRopeParams);
-                missIdx += runLen;
+                updateIdx += runLen;
             }
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
             WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
         }
-        if (statusDirty) {
-            RefreshSelectionStatusRange(runInfo.topKBaseOffset, statusBase, topkPos, topkPos + writeCount);
-        }
         localOffset += writeCount;
     }
+}
 
-    if (runInfo.s2Idx == 0 && GetSubBlockIdx() == 0) {
-        int32_t actualSeq = static_cast<int32_t>(constInfo.sparseBlockCount);
-        selectionKvActualSeqGm_.SetValue(selectionRow, actualSeq);
-        selectionKvBlockStatusGm_.SetValue(
-            selectionRow * (static_cast<int64_t>(constInfo.sparseBlockCount) + 1) +
-            static_cast<int64_t>(constInfo.sparseBlockCount),
-            actualSeq);
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::MergeKvFromSelection(
+    const RunInfo &runInfo)
+{
+    int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
+    int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
+    int64_t mergeMte3Idx = 0;
+    int64_t mte2Size = 0;
+    int64_t mte3Size = 0;
+    bool needWaitMte3ToMte2 = true;
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+
+    int64_t s2GmStartOffset = GetSubBlockIdx() == 0 ?
+        0 : CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize;
+    int64_t s2GmLimit = GetSubBlockIdx() == 0 ?
+        CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize : s2ProcessSize;
+    if (s2GmLimit > s2ProcessSize) {
+        s2GmLimit = s2ProcessSize;
     }
+
+    int64_t selectionRow = GetSelectionRow(runInfo);
+    int64_t topkCount = static_cast<int64_t>(constInfo.sparseBlockCount);
+    int64_t statusBase = selectionRow * selectionStatusStride_;
+    int64_t physicalSlotBase =
+        static_cast<int64_t>(runInfo.s2Idx) * static_cast<int64_t>(constInfo.s2BaseSize);
+    int64_t s2IdLimit = runInfo.curActualSeqLenOri;
+    if (constInfo.sparseMode == 3) {
+        s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size +
+                    runInfo.gS1Idx / constInfo.gSize + 1;
+    }
+
+    int64_t localOffset = s2GmStartOffset;
+    while (localOffset < s2GmLimit) {
+        if (needWaitMte3ToMte2) {
+            WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            needWaitMte3ToMte2 = false;
+        }
+
+        int64_t physicalSlot = physicalSlotBase + localOffset;
+        int64_t selectionBlockTableIdx = physicalSlot / selectionKvBlockSize_;
+        if (selectionBlockTableIdx >= selectionMaxBlockNum_) {
+            break;
+        }
+        int32_t selectionBlockNum = selectionKvBlockTableGm_.GetValue(
+            selectionRow * selectionMaxBlockNum_ + selectionBlockTableIdx);
+        if (selectionBlockNum < 0) {
+            break;
+        }
+
+        int64_t selectionBlockOffset = physicalSlot % selectionKvBlockSize_;
+        int64_t bufferedTokenCount = mte2Size - mte3Size;
+        int64_t runCount = 32 - bufferedTokenCount;
+        int64_t remainingTokenCount = s2GmLimit - localOffset;
+        if (runCount > remainingTokenCount) {
+            runCount = remainingTokenCount;
+        }
+        int64_t remainingSelectionBlock = selectionKvBlockSize_ - selectionBlockOffset;
+        if (runCount > remainingSelectionBlock) {
+            runCount = remainingSelectionBlock;
+        }
+
+        int64_t validRunCount = 0;
+        for (; validRunCount < runCount; validRunCount++) {
+            int32_t tokenId = selectionKvBlockStatusGm_.GetValue(
+                statusBase + physicalSlot + validRunCount);
+            if (tokenId < 0 || static_cast<int64_t>(tokenId) >= s2IdLimit) {
+                break;
+            }
+        }
+        if (validRunCount == 0) {
+            break;
+        }
+
+        int64_t selectionTokenOffset =
+            static_cast<int64_t>(selectionBlockNum) * selectionKvBlockSize_ +
+            selectionBlockOffset;
+        CopyInSelectionKvRun(
+            mte2Size, mte3Size, mergeMte3Idx, selectionTokenOffset, validRunCount);
+        localOffset += validRunCount;
+
+        bool flushCurrentBuffer = mte2Size - mte3Size >= 32 ||
+                                  localOffset >= s2GmLimit || validRunCount < runCount;
+        if (flushCurrentBuffer) {
+            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
+            mte3Size = mte2Size;
+            SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            mergeMte3Idx++;
+            needWaitMte3ToMte2 = true;
+        }
+        if (validRunCount < runCount) {
+            break;
+        }
+    }
+
+    if (unlikely(s2GmStartOffset + mte2Size < s2GmLimit)) {
+        SetFlag<AscendC::HardEvent::MTE3_V>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx & 1);
+        Duplicate(kvMergUb_, static_cast<KV_T>(0.0), constInfo.headDim);
+        SetFlag<AscendC::HardEvent::V_MTE3>(0);
+        WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+
+        DataCopyExtParams zeroParams;
+        zeroParams.blockCount = 1;
+        zeroParams.blockLen = constInfo.headDim * sizeof(KV_T);
+        zeroParams.srcStride = 0;
+        zeroParams.dstStride = 0;
+        for (int64_t s2GmOffset = s2GmStartOffset + mte2Size;
+             s2GmOffset < s2GmLimit; s2GmOffset++) {
+            DataCopyPad(
+                kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                           s2GmOffset * constInfo.headDim],
+                kvMergUb_, zeroParams);
+        }
+        zeroParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+        for (int64_t s2GmOffset = s2GmStartOffset + mte2Size;
+             s2GmOffset < s2GmLimit; s2GmOffset++) {
+            DataCopyPad(
+                kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                           512 * constInfo.headDim + s2GmOffset * constInfo.headDimRope],
+                kvMergUb_, zeroParams);
+        }
+        SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx & 1);
+        mergeMte3Idx++;
+    }
+
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+    v0ValidSizeUb_.SetValue(runInfo.loop % MERGE_CACHE_GM_BUF_NUM, mte2Size);
+    SetFlag<AscendC::HardEvent::S_MTE3>(1);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(1);
+    DataCopyExtParams validSizeParams;
+    validSizeParams.blockCount = 1;
+    validSizeParams.blockLen = 128 * sizeof(int32_t);
+    validSizeParams.srcStride = 0;
+    validSizeParams.dstStride = 0;
+    DataCopyPad(
+        kvValidSizeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * (128 * 2) +
+                       GetSubBlockIdx() * 128],
+        v0ValidSizeUb_, validSizeParams);
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void
+FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::
+MergeKvFromSelectionWithSparseUpdates(const RunInfo &runInfo)
+{
+    int64_t selectionRow = GetSelectionRow(runInfo);
+    int64_t membershipBase = selectionRow * selectionMembershipStride_;
+    LocalTensor<int16_t> sparsePlanLocal =
+        v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET *
+            sizeof(int32_t) / sizeof(int16_t)];
+    DataCopyExtParams sparsePlanParams;
+    sparsePlanParams.blockCount = 1;
+    sparsePlanParams.blockLen =
+        SELECTION_SPARSE_PLAN_VALUE_COUNT * sizeof(int16_t);
+    sparsePlanParams.srcStride = 0;
+    sparsePlanParams.dstStride = 0;
+    DataCopyPadExtParams<int16_t> sparsePlanPadParams{false, 0, 0, 0};
+    DataCopyPad(sparsePlanLocal,
+        selectionMembershipMapGm_[membershipBase + selectionUpdatePlanOffset_],
+        sparsePlanParams, sparsePlanPadParams);
+    SetFlag<AscendC::HardEvent::MTE2_S>(1);
+    WaitFlag<AscendC::HardEvent::MTE2_S>(1);
+
+    int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
+    int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
+    int64_t mergeMte3Idx = 0;
+    int64_t mte2Size = 0;
+    int64_t mte3Size = 0;
+    bool needWaitMte3ToMte2 = true;
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    SetFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+
+    int64_t s2GmStartOffset = GetSubBlockIdx() == 0 ? 0 :
+        CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize;
+    int64_t s2GmLimit = GetSubBlockIdx() == 0 ?
+        CeilDiv(s2Pair, 2L) * 2 * constInfo.sparseBlockSize : s2ProcessSize;
+    if (s2GmLimit > s2ProcessSize) {
+        s2GmLimit = s2ProcessSize;
+    }
+
+    int64_t physicalSlotBase =
+        static_cast<int64_t>(runInfo.s2Idx) * static_cast<int64_t>(constInfo.s2BaseSize);
+    int64_t s2IdLimit = runInfo.curActualSeqLenOri;
+    if (constInfo.sparseMode == 3) {
+        s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size +
+                    runInfo.gS1Idx / constInfo.gSize + 1;
+    }
+
+    int32_t updateIdx = 0;
+    int64_t rangeStart = physicalSlotBase + s2GmStartOffset;
+    while (updateIdx < selectionUpdatePlanCount_ &&
+           static_cast<int32_t>(sparsePlanLocal.GetValue(updateIdx * 2)) - 1 <
+               rangeStart) {
+        updateIdx++;
+    }
+
+    int64_t localOffset = s2GmStartOffset;
+    while (localOffset < s2GmLimit) {
+        if (needWaitMte3ToMte2) {
+            WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            needWaitMte3ToMte2 = false;
+        }
+
+        int64_t physicalSlot = physicalSlotBase + localOffset;
+        while (updateIdx < selectionUpdatePlanCount_ &&
+               static_cast<int32_t>(sparsePlanLocal.GetValue(updateIdx * 2)) - 1 <
+                   physicalSlot) {
+            updateIdx++;
+        }
+        int64_t nextDestinationSlot = static_cast<int64_t>(constInfo.sparseBlockCount);
+        if (updateIdx < selectionUpdatePlanCount_) {
+            nextDestinationSlot = static_cast<int32_t>(
+                sparsePlanLocal.GetValue(updateIdx * 2)) - 1;
+        }
+
+        if (nextDestinationSlot == physicalSlot) {
+            int32_t tokenId = static_cast<int32_t>(
+                sparsePlanLocal.GetValue(updateIdx * 2 + 1)) - 1;
+            int64_t keyOffset = GetKeyGmOffset(tokenId, runInfo, s2IdLimit);
+            CopyInSingleKv(mte2Size, mte3Size, mergeMte3Idx, tokenId,
+                           keyOffset, -1, s2IdLimit, runInfo);
+            localOffset++;
+            updateIdx++;
+        } else {
+            int64_t selectionBlockTableIdx = physicalSlot / selectionKvBlockSize_;
+            if (selectionBlockTableIdx >= selectionMaxBlockNum_) {
+                break;
+            }
+            int32_t selectionBlockNum = selectionKvBlockTableGm_.GetValue(
+                selectionRow * selectionMaxBlockNum_ + selectionBlockTableIdx);
+            if (selectionBlockNum < 0) {
+                break;
+            }
+
+            int64_t selectionBlockOffset = physicalSlot % selectionKvBlockSize_;
+            int64_t runCount = 32 - (mte2Size - mte3Size);
+            int64_t remainingTokenCount = s2GmLimit - localOffset;
+            if (runCount > remainingTokenCount) {
+                runCount = remainingTokenCount;
+            }
+            int64_t remainingSelectionBlock =
+                selectionKvBlockSize_ - selectionBlockOffset;
+            if (runCount > remainingSelectionBlock) {
+                runCount = remainingSelectionBlock;
+            }
+            if (nextDestinationSlot > physicalSlot &&
+                runCount > nextDestinationSlot - physicalSlot) {
+                runCount = nextDestinationSlot - physicalSlot;
+            }
+            if (runCount <= 0) {
+                break;
+            }
+
+            int64_t selectionTokenOffset =
+                static_cast<int64_t>(selectionBlockNum) * selectionKvBlockSize_ +
+                selectionBlockOffset;
+            CopyInSelectionKvRun(mte2Size, mte3Size, mergeMte3Idx,
+                                 selectionTokenOffset, runCount);
+            localOffset += runCount;
+        }
+
+        if (mte2Size - mte3Size >= 32 || localOffset >= s2GmLimit) {
+            CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset,
+                              mergeMte3Idx, runInfo);
+            mte3Size = mte2Size;
+            SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+            mergeMte3Idx++;
+            needWaitMte3ToMte2 = true;
+        }
+    }
+
+    if (unlikely(s2GmStartOffset + mte2Size < s2GmLimit)) {
+        SetFlag<AscendC::HardEvent::MTE3_V>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_V>(0);
+        WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx & 1);
+        Duplicate(kvMergUb_, static_cast<KV_T>(0.0), constInfo.headDim);
+        SetFlag<AscendC::HardEvent::V_MTE3>(0);
+        WaitFlag<AscendC::HardEvent::V_MTE3>(0);
+
+        DataCopyExtParams zeroParams;
+        zeroParams.blockCount = 1;
+        zeroParams.blockLen = constInfo.headDim * sizeof(KV_T);
+        zeroParams.srcStride = 0;
+        zeroParams.dstStride = 0;
+        for (int64_t s2GmOffset = s2GmStartOffset + mte2Size;
+             s2GmOffset < s2GmLimit; s2GmOffset++) {
+            DataCopyPad(
+                kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                           s2GmOffset * constInfo.headDim],
+                kvMergUb_, zeroParams);
+        }
+        zeroParams.blockLen = constInfo.headDimRope * sizeof(KV_T);
+        for (int64_t s2GmOffset = s2GmStartOffset + mte2Size;
+             s2GmOffset < s2GmLimit; s2GmOffset++) {
+            DataCopyPad(
+                kvMergeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * 512 * 576 +
+                           512 * constInfo.headDim +
+                           s2GmOffset * constInfo.headDimRope],
+                kvMergUb_, zeroParams);
+        }
+        SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx & 1);
+        mergeMte3Idx++;
+    }
+
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(0);
+    WaitFlag<AscendC::HardEvent::MTE3_MTE2>(1);
+    v0ValidSizeUb_.SetValue(runInfo.loop % MERGE_CACHE_GM_BUF_NUM, mte2Size);
+    SetFlag<AscendC::HardEvent::S_MTE3>(1);
+    WaitFlag<AscendC::HardEvent::S_MTE3>(1);
+    DataCopyExtParams validSizeParams;
+    validSizeParams.blockCount = 1;
+    validSizeParams.blockLen = 128 * sizeof(int32_t);
+    validSizeParams.srcStride = 0;
+    validSizeParams.dstStride = 0;
+    DataCopyPad(
+        kvValidSizeGm_[runInfo.loop % MERGE_CACHE_GM_BUF_NUM * (128 * 2) +
+                       GetSubBlockIdx() * 128],
+        v0ValidSizeUb_, validSizeParams);
 }
 
 // b s1 k
 template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::MergeKv(const RunInfo &runInfo)
 {
+    selectionUpdatePlanActive_ = false;
+    selectionSparseUpdatePlanActive_ = false;
+    selectionUpdatePlanOffset_ = 0;
+    selectionUpdatePlanCount_ = 0;
+    selectionDirectRowStride_ = 0;
+    selectionPairedCopyActive_ = false;
+    bool useSelectionPlanSource = false;
+    bool useExternalPlanSource = false;
+    int64_t selectionRow = -1;
+    int64_t selectionMembershipBase = -1;
+    if (UseSetResidentSelection()) {
+        selectionRow = GetSelectionRow(runInfo);
+        selectionDataRow_ = selectionRow;
+        selectionMembershipBase = selectionRow * selectionMembershipStride_;
+        LocalTensor<int16_t> controlLocal =
+            v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET * sizeof(int32_t) / sizeof(int16_t)];
+        bool membershipMapReady =
+            IsSelectionMembershipMapReady(selectionMembershipBase, controlLocal);
+        int16_t planMarker = controlLocal.GetValue(1);
+        selectionSparseUpdatePlanActive_ =
+            planMarker == SELECTION_SPARSE_PLAN_READY_MARKER;
+        selectionUpdatePlanActive_ = selectionSparseUpdatePlanActive_ ||
+            planMarker == SELECTION_PLAN_READY_MARKER ||
+            planMarker == SELECTION_EXTERNAL_PLAN_READY_MARKER;
+        useExternalPlanSource =
+            planMarker == SELECTION_EXTERNAL_PLAN_READY_MARKER;
+        int64_t externalPhysicalRow =
+            static_cast<int64_t>(controlLocal.GetValue(4));
+        if (useExternalPlanSource && externalPhysicalRow >= 0) {
+            selectionDataRow_ = externalPhysicalRow;
+            int64_t externalDirectRowStride =
+                static_cast<int64_t>(controlLocal.GetValue(6));
+            if (controlLocal.GetValue(5) == SELECTION_DIRECT_LAYOUT_MARKER &&
+                externalDirectRowStride > 0) {
+                selectionDirectRowStride_ = externalDirectRowStride;
+            }
+            selectionPairedCopyActive_ =
+                controlLocal.GetValue(7) == SELECTION_PAIRED_COPY_MARKER &&
+                selectionDirectRowStride_ > 0;
+        }
+        if (!selectionUpdatePlanActive_ && membershipMapReady) {
+            MergeKvFromSelection(runInfo);
+            return;
+        }
+        selectionUpdatePlanOffset_ = selectionUpdatePlanActive_ ?
+            static_cast<int64_t>(controlLocal.GetValue(3)) : 0;
+        selectionUpdatePlanCount_ = selectionSparseUpdatePlanActive_ ?
+            static_cast<int32_t>(controlLocal.GetValue(2)) : 0;
+        if (selectionSparseUpdatePlanActive_ && selectionUpdatePlanCount_ > 0 &&
+            selectionUpdatePlanCount_ <= SELECTION_SYNC_COPY_CAPACITY) {
+            MergeKvFromSelectionWithSparseUpdates(runInfo);
+            return;
+        }
+        useSelectionPlanSource = !selectionSparseUpdatePlanActive_ &&
+            selectionUpdatePlanActive_ &&
+            controlLocal.GetValue(2) > 0;
+    }
+
     int64_t s2ProcessSize = runInfo.actualSingleProcessSInnerSize;
     int64_t s2Pair = CeilDiv(s2ProcessSize, 2L * constInfo.sparseBlockSize);
     int64_t topkGmBaseOffset = 0;
@@ -1527,20 +3349,159 @@ __aicore__ inline void FusedSparseAttentionOverlapVectorService<FusedSparseAtten
     if (s2GmLimit > s2ProcessSize) {
         s2GmLimit = s2ProcessSize;
     }
-    for (int64_t s2GmOffsetArray = s2GmStartOffset; s2GmOffsetArray < s2GmLimit; s2GmOffsetArray += 2 * constInfo.sparseBlockSize) {
+
+    int64_t cachedSelectionBlockTableIdx = -1;
+    int32_t cachedSelectionBlockNum = -1;
+    LocalTensor<int16_t> selectionPlanLocal =
+        v0ValidSizeBuff.Get<int16_t>()[SELECTION_STATUS_UB_OFFSET * sizeof(int32_t) / sizeof(int16_t)];
+    LocalTensor<uint32_t> packedSelectionPlanLocal =
+        selectionPlanLocal.ReinterpretCast<uint32_t>();
+    if (useSelectionPlanSource && s2GmStartOffset < s2GmLimit) {
+        int64_t logicalPlanStart =
+            static_cast<int64_t>(runInfo.s2Idx) *
+                static_cast<int64_t>(constInfo.s2BaseSize) +
+            s2GmStartOffset;
+        int64_t planCount = s2GmLimit - s2GmStartOffset;
+        DataCopyExtParams planParams;
+        planParams.blockCount = 1;
+        planParams.blockLen = static_cast<uint32_t>(planCount * sizeof(int16_t));
+        planParams.srcStride = 0;
+        planParams.dstStride = 0;
+        DataCopyPadExtParams<int16_t> planPadParams{false, 0, 0, 0};
+        DataCopyPad(selectionPlanLocal,
+            selectionMembershipMapGm_[selectionMembershipBase +
+                                      selectionUpdatePlanOffset_ + logicalPlanStart],
+            planParams, planPadParams);
+        SetFlag<AscendC::HardEvent::MTE2_S>(1);
+        WaitFlag<AscendC::HardEvent::MTE2_S>(1);
+    }
+    int64_t s2IdLimit = runInfo.curActualSeqLenOri;
+    if (constInfo.sparseMode == 3) {
+        s2IdLimit = runInfo.curActualSeqLenOri - runInfo.actS1Size + runInfo.gS1Idx / constInfo.gSize + 1;
+    }
+    for (int64_t s2GmOffsetArray = s2GmStartOffset; s2GmOffsetArray < s2GmLimit;
+         s2GmOffsetArray += 2 * constInfo.sparseBlockSize) {
         if (needWaitMte3ToMte2) {
             WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             needWaitMte3ToMte2 = false;
         }
-        GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
+        int16_t currentPlanValue0 = SELECTION_COMPACT_PLAN_INVALID;
+        int16_t currentPlanValue1 = SELECTION_COMPACT_PLAN_INVALID;
+        if (useSelectionPlanSource) {
+            int64_t bufferedTokenCount = mte2Size - mte3Size;
+            int64_t selectionRunLimit = 32 - bufferedTokenCount;
+            int64_t remainingTokenCount = s2GmLimit - s2GmOffsetArray;
+            if (selectionRunLimit > remainingTokenCount) {
+                selectionRunLimit = remainingTokenCount;
+            }
+            int64_t localPlanStart = s2GmOffsetArray - s2GmStartOffset;
+            uint32_t packedPlanValue =
+                packedSelectionPlanLocal.GetValue(localPlanStart / 2);
+            currentPlanValue0 = static_cast<int16_t>(packedPlanValue & 0xFFFFU);
+            currentPlanValue1 = static_cast<int16_t>(packedPlanValue >> 16);
+            int32_t firstSourceSlot = IsSelectionPlanHit(currentPlanValue0) ?
+                DecodeSelectionPlanSlot(currentPlanValue0) : -1;
+            int64_t selectionRunStart = GetSelectionSlotTokenOffset(
+                selectionDataRow_, firstSourceSlot, cachedSelectionBlockTableIdx,
+                cachedSelectionBlockNum);
+            if (firstSourceSlot >= 0) {
+                int64_t remainingInSelectionBlock = selectionDirectRowStride_ > 0 ?
+                    selectionDirectRowStride_ - firstSourceSlot :
+                    selectionKvBlockSize_ - firstSourceSlot % selectionKvBlockSize_;
+                if (selectionRunLimit > remainingInSelectionBlock) {
+                    selectionRunLimit = remainingInSelectionBlock;
+                }
+            }
+            int64_t selectionRunCount = selectionRunStart >= 0 ? 1 : 0;
+            if (selectionRunCount == 1 && selectionRunLimit > 1 &&
+                IsSelectionPlanHit(currentPlanValue1) &&
+                DecodeSelectionPlanSlot(currentPlanValue1) == firstSourceSlot + 1) {
+                selectionRunCount = 2;
+            }
+            while (selectionRunCount >= 2 && selectionRunCount < selectionRunLimit) {
+                int64_t nextPlanStart = localPlanStart + selectionRunCount;
+                uint32_t nextPackedPlanValue =
+                    packedSelectionPlanLocal.GetValue(nextPlanStart / 2);
+                int16_t nextPlanValue0 =
+                    static_cast<int16_t>(nextPackedPlanValue & 0xFFFFU);
+                if (!IsSelectionPlanHit(nextPlanValue0) ||
+                    DecodeSelectionPlanSlot(nextPlanValue0) !=
+                        firstSourceSlot + selectionRunCount) {
+                    break;
+                }
+                selectionRunCount++;
+                if (selectionRunCount >= selectionRunLimit) {
+                    break;
+                }
+                int16_t nextPlanValue1 =
+                    static_cast<int16_t>(nextPackedPlanValue >> 16);
+                if (!IsSelectionPlanHit(nextPlanValue1) ||
+                    DecodeSelectionPlanSlot(nextPlanValue1) !=
+                        firstSourceSlot + selectionRunCount) {
+                    break;
+                }
+                selectionRunCount++;
+            }
+            if (selectionRunCount > 2 && (selectionRunCount & 1) != 0 &&
+                s2GmOffsetArray + selectionRunCount < s2GmLimit) {
+                selectionRunCount--;
+            }
+            if (selectionRunCount >= 2) {
+                CopyInSelectionKvRun(
+                    mte2Size, mte3Size, mergeMte3Idx, selectionRunStart, selectionRunCount);
+                if (mte2Size - mte3Size >= 32 ||
+                    s2GmOffsetArray + selectionRunCount >= s2GmLimit) {
+                    CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
+                    mte3Size = mte2Size;
+                    SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
+                    mergeMte3Idx++;
+                    needWaitMte3ToMte2 = true;
+                }
+                s2GmOffsetArray += selectionRunCount - 2 * constInfo.sparseBlockSize;
+                continue;
+            }
+        }
+        int64_t selectionTokenOffset0 = -1;
+        int64_t selectionTokenOffset1 = -1;
+        if (useSelectionPlanSource) {
+            int32_t sourceSlot0 = IsSelectionPlanHit(currentPlanValue0) ?
+                DecodeSelectionPlanSlot(currentPlanValue0) : -1;
+            selectionTokenOffset0 = GetSelectionSlotTokenOffset(
+                selectionDataRow_, sourceSlot0, cachedSelectionBlockTableIdx,
+                cachedSelectionBlockNum);
+            if (s2GmOffsetArray + constInfo.sparseBlockSize < s2GmLimit) {
+                int32_t sourceSlot1 = IsSelectionPlanHit(currentPlanValue1) ?
+                    DecodeSelectionPlanSlot(currentPlanValue1) : -1;
+                selectionTokenOffset1 = GetSelectionSlotTokenOffset(
+                    selectionDataRow_, sourceSlot1, cachedSelectionBlockTableIdx,
+                    cachedSelectionBlockNum);
+            }
+        }
+        bool externalHit0 = useExternalPlanSource &&
+            constInfo.sparseBlockSize == 1 &&
+            selectionTokenOffset0 >= 0;
+        bool externalHit1 = useExternalPlanSource &&
+            constInfo.sparseBlockSize == 1 &&
+            selectionTokenOffset1 >= 0;
+        if (externalHit0) {
+            s2IdxArray0 = 0;
+        } else {
+            GetRealS2Idx(s2GmOffsetArray, s2IdxArray0, topkGmBaseOffset, runInfo);
+        }
         if (unlikely(s2IdxArray0 < 0)) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
             SetFlag<AscendC::HardEvent::MTE3_MTE2>(mergeMte3Idx % 2);
             mergeMte3Idx++;
             break;
         }
-        GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize, s2IdxArray1, topkGmBaseOffset, runInfo);
-        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1, runInfo);
+        if (externalHit1) {
+            s2IdxArray1 = 0;
+        } else {
+            GetRealS2Idx(s2GmOffsetArray + constInfo.sparseBlockSize,
+                         s2IdxArray1, topkGmBaseOffset, runInfo);
+        }
+        CopyInKv(mte2Size, mte3Size, mergeMte3Idx, s2IdxArray0, s2IdxArray1,
+                 selectionTokenOffset0, selectionTokenOffset1, s2IdLimit, runInfo);
         if ((mte2Size - mte3Size + 2 * constInfo.sparseBlockSize > 32) ||
             s2GmOffsetArray + 2 * constInfo.sparseBlockSize >= s2GmLimit) {
             CopyOutMrgeResult(mte2Size, mte3Size, s2GmStartOffset, mergeMte3Idx, runInfo);
@@ -1761,7 +3722,7 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Bmm
     dataCopyParams.blockLen = actualColumnCount * sizeof(OUT_T);
     dataCopyParams.srcStride = (columnCount - actualColumnCount) / (BYTE_BLOCK / sizeof(OUT_T));
     dataCopyParams.dstStride = 0;
-    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);    
+    DataCopyPad(attentionOutGm[info.attenOutOffset + wsMStart * actualColumnCount], attenOutUb, dataCopyParams);
     return;
 }
 
@@ -1819,7 +3780,7 @@ FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::Dea
 
     SetFlag<AscendC::HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
     WaitFlag<AscendC::HardEvent::MTE2_V>(SYNC_INPUT_BUF1_FLAG);
-    
+
     // 将绝对值大�?e10的数置为0
     LocalTensor<T> bmm2ResUb = tmpBuff1.Get<T>();
     bmm2ResUb.SetSize(vec2ComputeSize);
