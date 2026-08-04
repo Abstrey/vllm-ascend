@@ -1,0 +1,23 @@
+[B-diag] nano_path='/mnt/share_space/l00933205/code/mte_fused/nanovllm-DSA-offload/torch_extension'
+[B-diag] ops_overlap/ exists: True
+[B-diag] ops_overlap/__init__.py exists: True
+[B-diag] _C*.so files: ['_C.cpython-311-aarch64-linux-gnu.so']
+[B-diag] libcust_opapi.so exists: True (/mnt/share_space/l00933205/code/mte_fused/nanovllm-DSA-offload/torch_extension/ops_overlap/../../_custom_opp/vendors/ops-overlap/op_api/lib/libcust_opapi.so)
+[B-diag] sys.path[0:3]=['/mnt/share_space/l00933205/code/mte_fused/nanovllm-DSA-offload/torch_extension', '/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut', '/usr/local/Ascend/cann-9.0.0/python/site-packages']
+/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py:490: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  dst_slots = torch.empty_like(src_ids_t)
+Traceback (most recent call last):
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 616, in <module>
+    main()
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 606, in main
+    result = run_b(args)
+             ^^^^^^^^^^^
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 511, in run_b
+    _b_lidu()
+  File "/mnt/share_space/l00933205/code/mte_fused/vllm-ascend/tests/ut/test_fused_overlap_vs_lidu_perf.py", line 501, in _b_lidu
+    return torch.ops.ops_overlap.lidu_decode_update_out.default(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.11.10/lib/python3.11/site-packages/torch/_ops.py", line 1319, in __getattr__
+    raise AttributeError(
+AttributeError: '_OpNamespace' 'ops_overlap' object has no attribute 'lidu_decode_update_out'
+[ERROR] 2026-08-04-21:53:29 (PID:42084, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception
