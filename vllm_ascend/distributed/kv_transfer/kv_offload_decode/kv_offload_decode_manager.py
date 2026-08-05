@@ -1,4 +1,5 @@
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
+    KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
 
@@ -61,10 +63,137 @@ FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT = (
 
 
 _SUBSCRIBED_COMPUTE_STREAMS: set[object] = set()
+_CPU_CACHE_ALIGNMENT = 2 * 1024 * 1024
+_CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER = 3 * _CPU_CACHE_ALIGNMENT
+_VLLM_NULL_BLOCK_COUNT = 1
 
 
 def get_subscribed_compute_streams() -> set:
     return _SUBSCRIBED_COMPUTE_STREAMS
+
+
+@dataclass(frozen=True)
+class KVOffloadDecodeMemoryBudget:
+    npu_limit_blocks: int
+    dram_limit_blocks: int
+    workload_limit_blocks: int
+    final_num_blocks: int
+    final_planner_bytes: int
+    planned_host_bytes: int
+    planned_device_bytes: int
+    host_alignment_reserve_bytes: int
+    limiting_factor: str
+
+
+def _split_host_device_kv_specs(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> tuple[list[KVCacheSpec], list[KVCacheSpec]]:
+    host_specs: list[KVCacheSpec] = []
+    device_specs: list[KVCacheSpec] = []
+    for spec in kv_cache_spec.values():
+        if getattr(spec, "store_on_host", False):
+            host_specs.append(spec)
+        else:
+            device_specs.append(spec)
+    if not host_specs:
+        raise ValueError("KV offload decode requires at least one host KV cache spec")
+    if not device_specs:
+        raise ValueError("KV offload decode requires at least one device KV cache spec")
+    block_sizes = {spec.block_size for spec in host_specs + device_specs}
+    if len(block_sizes) != 1:
+        raise ValueError(
+            "KV offload decode memory planning requires one shared block size, "
+            f"got {sorted(block_sizes)}"
+        )
+    return host_specs, device_specs
+
+
+def plan_kv_offload_decode_memory(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    vllm_config: VllmConfig,
+    available_device_memory_bytes: int,
+    dram_limit_bytes: int,
+    keep_device_kv_cache: bool,
+) -> KVOffloadDecodeMemoryBudget:
+    """Bound KV offload decode blocks by NPU, DRAM, and active demand."""
+    host_specs, device_specs = _split_host_device_kv_specs(kv_cache_spec)
+    host_page_size_bytes = sum(spec.page_size_bytes for spec in host_specs)
+    device_page_size_bytes = sum(spec.page_size_bytes for spec in device_specs)
+    total_page_size_bytes = host_page_size_bytes + device_page_size_bytes
+
+    host_alignment_reserve_bytes = (
+        len(host_specs) * _CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
+    )
+    usable_dram_bytes = max(dram_limit_bytes - host_alignment_reserve_bytes, 0)
+    dram_limit_blocks = usable_dram_bytes // host_page_size_bytes
+
+    npu_page_size_bytes = (
+        total_page_size_bytes if keep_device_kv_cache else device_page_size_bytes
+    )
+    npu_limit_blocks = max(available_device_memory_bytes, 0) // npu_page_size_bytes
+
+    max_blocks_per_request = max(
+        cdiv(
+            spec.max_memory_usage_bytes(vllm_config),
+            spec.page_size_bytes,
+        )
+        for spec in host_specs + device_specs
+    )
+    workload_limit_blocks = (
+        max_blocks_per_request * vllm_config.scheduler_config.max_num_seqs
+        + _VLLM_NULL_BLOCK_COUNT
+    )
+
+    limits = {
+        "npu": npu_limit_blocks,
+        "dram": dram_limit_blocks,
+        "workload": workload_limit_blocks,
+    }
+    limiting_factor = min(limits, key=limits.get)
+    final_num_blocks = limits[limiting_factor]
+    final_planner_bytes = final_num_blocks * total_page_size_bytes
+    planned_host_bytes = final_num_blocks * host_page_size_bytes
+    planned_device_bytes = final_num_blocks * npu_page_size_bytes
+    return KVOffloadDecodeMemoryBudget(
+        npu_limit_blocks=npu_limit_blocks,
+        dram_limit_blocks=dram_limit_blocks,
+        workload_limit_blocks=workload_limit_blocks,
+        final_num_blocks=final_num_blocks,
+        final_planner_bytes=final_planner_bytes,
+        planned_host_bytes=planned_host_bytes,
+        planned_device_bytes=planned_device_bytes,
+        host_alignment_reserve_bytes=host_alignment_reserve_bytes,
+        limiting_factor=limiting_factor,
+    )
+
+
+def get_kv_offload_decode_cpu_pool_size_bytes(
+    kv_cache_config: KVCacheConfig,
+) -> int:
+    """Return a safe upper bound for aligned host KV allocations."""
+    layer_specs: dict[str, KVCacheSpec] = {}
+    for group in kv_cache_config.kv_cache_groups:
+        if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+            layer_specs.update(group.kv_cache_spec.kv_cache_specs)
+        else:
+            layer_specs.update(
+                (layer_name, group.kv_cache_spec)
+                for layer_name in group.layer_names
+            )
+    host_specs = [
+        spec
+        for spec in layer_specs.values()
+        if getattr(spec, "store_on_host", False)
+    ]
+    if not host_specs:
+        raise ValueError("KV offload decode requires host-resident KV cache specs")
+    raw_host_bytes = kv_cache_config.num_blocks * sum(
+        spec.page_size_bytes for spec in host_specs
+    )
+    alignment_reserve_bytes = (
+        len(host_specs) * _CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
+    )
+    return raw_host_bytes + alignment_reserve_bytes
 
 
 class KVOffloadDecodeManager:
@@ -168,13 +297,31 @@ class KVOffloadDecodeManager:
 
         self._build_cpp()
 
+        dram_limit_bytes = int(
+            kv_offload_decode_config.dram_size_per_dp_GB * 1024 * 1024 * 1024
+        )
+        planned_pool_size_bytes = get_kv_offload_decode_cpu_pool_size_bytes(
+            kv_cache_config
+        )
+        if planned_pool_size_bytes > dram_limit_bytes:
+            raise ValueError(
+                "KV offload decode planned CPU pool exceeds DRAM limit after "
+                "alignment: "
+                f"planned={planned_pool_size_bytes / (1 << 30):.2f} GiB, "
+                f"limit={kv_offload_decode_config.dram_size_per_dp_GB} GiB, "
+                f"num_blocks={kv_cache_config.num_blocks}"
+            )
+        actual_pool_size_bytes = min(planned_pool_size_bytes, dram_limit_bytes)
         logger.info(
-            f"KVOffloadManager start init CPU KV pool with {kv_offload_decode_config.dram_size_per_dp_GB} "
-            "GB dram per dp group, it might be time consuming, please wait."
+            "KVOffloadDecodeManager starts CPU KV pool initialization: "
+            "planned=%.2f GiB, configured_limit=%s GiB, num_blocks=%s.",
+            actual_pool_size_bytes / (1 << 30),
+            kv_offload_decode_config.dram_size_per_dp_GB,
+            kv_cache_config.num_blocks,
         )
         config = offload.OffloadConfig()
         config.device_id = torch_npu.npu.current_device()
-        config.size = kv_offload_decode_config.dram_size_per_dp_GB * 1024 * 1024 * 1024
+        config.size = actual_pool_size_bytes
         config.world_size = self.tp_size
         config.rank_id = self.tp_rank
         offload.initialize(config)

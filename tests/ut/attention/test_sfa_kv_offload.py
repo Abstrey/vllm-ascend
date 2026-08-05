@@ -14,11 +14,141 @@ from vllm_ascend.attention.sfa_kv_offload import (  # noqa: E402
     AscendSFAKVOffloadMetadataBuilder,
 )
 from vllm_ascend.attention.sfa_v1 import AscendSFAMetadataBuilder  # noqa: E402
+from vllm_ascend.distributed.kv_transfer.kv_offload_decode import (  # noqa: E402
+    kv_offload_decode_manager as offload_manager_module,
+)
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import (  # noqa: E402
     FSA_EXTERNAL_PLAN_READY_MARKER,
     FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT,
     FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT,
+    get_kv_offload_decode_cpu_pool_size_bytes,
+    plan_kv_offload_decode_memory,
 )
+
+
+class _FakeKVCacheSpec:
+    def __init__(
+        self,
+        *,
+        page_size_bytes,
+        max_blocks_per_request,
+        store_on_host,
+        block_size=128,
+    ):
+        self.page_size_bytes = page_size_bytes
+        self.max_blocks_per_request = max_blocks_per_request
+        self.store_on_host = store_on_host
+        self.block_size = block_size
+
+    def max_memory_usage_bytes(self, _vllm_config):
+        return self.max_blocks_per_request * self.page_size_bytes
+
+
+def _make_memory_plan_inputs(max_num_seqs=2):
+    specs = {
+        "host.0": _FakeKVCacheSpec(
+            page_size_bytes=1024,
+            max_blocks_per_request=100,
+            store_on_host=True,
+        ),
+        "host.1": _FakeKVCacheSpec(
+            page_size_bytes=1024,
+            max_blocks_per_request=100,
+            store_on_host=True,
+        ),
+        "device.0": _FakeKVCacheSpec(
+            page_size_bytes=512,
+            max_blocks_per_request=100,
+            store_on_host=False,
+        ),
+    }
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs)
+    )
+    alignment_reserve = (
+        2 * offload_manager_module._CPU_CACHE_MAX_ALIGNMENT_OVERHEAD_PER_LAYER
+    )
+    return specs, vllm_config, alignment_reserve
+
+
+def test_kv_offload_memory_plan_is_limited_by_active_workload():
+    specs, vllm_config, alignment_reserve = _make_memory_plan_inputs()
+
+    budget = plan_kv_offload_decode_memory(
+        kv_cache_spec=specs,
+        vllm_config=vllm_config,
+        available_device_memory_bytes=1000 * 512,
+        dram_limit_bytes=alignment_reserve + 1000 * 2048,
+        keep_device_kv_cache=False,
+    )
+
+    assert budget.npu_limit_blocks == 1000
+    assert budget.dram_limit_blocks == 1000
+    assert budget.workload_limit_blocks == 201
+    assert budget.final_num_blocks == 201
+    assert budget.final_planner_bytes == 201 * (2048 + 512)
+    assert budget.planned_host_bytes == 201 * 2048
+    assert budget.planned_device_bytes == 201 * 512
+    assert budget.limiting_factor == "workload"
+
+
+def test_kv_offload_memory_plan_is_limited_by_dram_capacity():
+    specs, vllm_config, alignment_reserve = _make_memory_plan_inputs()
+
+    budget = plan_kv_offload_decode_memory(
+        kv_cache_spec=specs,
+        vllm_config=vllm_config,
+        available_device_memory_bytes=1000 * 512,
+        dram_limit_bytes=alignment_reserve + 150 * 2048,
+        keep_device_kv_cache=False,
+    )
+
+    assert budget.dram_limit_blocks == 150
+    assert budget.final_num_blocks == 150
+    assert budget.limiting_factor == "dram"
+
+
+def test_kv_offload_memory_plan_keep_device_counts_full_npu_page():
+    specs, vllm_config, alignment_reserve = _make_memory_plan_inputs()
+    total_page_size = 2048 + 512
+
+    budget = plan_kv_offload_decode_memory(
+        kv_cache_spec=specs,
+        vllm_config=vllm_config,
+        available_device_memory_bytes=125 * total_page_size,
+        dram_limit_bytes=alignment_reserve + 1000 * 2048,
+        keep_device_kv_cache=True,
+    )
+
+    assert budget.npu_limit_blocks == 125
+    assert budget.final_num_blocks == 125
+    assert budget.planned_device_bytes == 125 * total_page_size
+    assert budget.limiting_factor == "npu"
+
+
+def test_kv_offload_cpu_pool_size_includes_per_layer_alignment_reserve():
+    specs, _, alignment_reserve = _make_memory_plan_inputs()
+    kv_cache_config = SimpleNamespace(
+        num_blocks=200,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=["host.0"],
+                kv_cache_spec=specs["host.0"],
+            ),
+            SimpleNamespace(
+                layer_names=["host.1"],
+                kv_cache_spec=specs["host.1"],
+            ),
+            SimpleNamespace(
+                layer_names=["device.0"],
+                kv_cache_spec=specs["device.0"],
+            ),
+        ],
+    )
+
+    assert get_kv_offload_decode_cpu_pool_size_bytes(
+        kv_cache_config
+    ) == (200 * 2048 + alignment_reserve)
 
 
 def _make_boundary_decode_metadata():
