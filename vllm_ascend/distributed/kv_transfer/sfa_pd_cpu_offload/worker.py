@@ -204,13 +204,18 @@ class SFAPDCpuOffloadConsumerWorker:
         return
 
     def _cleanup_request_state(self, req_ids: set[str]) -> None:
+        ext_ids = set()
         for req_id in req_ids:
             ext_id = get_external_request_id(req_id)
+            ext_ids.add(ext_id)
             self._cpu_blocks_by_req.pop(req_id, None)
             self.request_map.pop(ext_id, None)
             self._dest_blocks_by_req.pop(ext_id, None)
             self._pending_done.discard(ext_id)
             self._terminal_ext_ids.discard(ext_id)
+        read_thread = getattr(self, "_mf_read_thread", None)
+        if read_thread is not None:
+            read_thread.discard_requests(ext_ids)
 
     def _gather_tp_read_status(
         self,
@@ -502,9 +507,9 @@ class SFAPDCpuOffloadProducerWorker:
         * reset ``self.current_layer`` — the per-step layer counter that
           ``save_kv_layer`` increments; without the reset it drifts to
           ``>= total_layers`` and every request after the first is skipped.
-        * adjust ``remote_port`` by ``tp_rank`` — D's ROUTER binds
+        * adjust ``remote_port`` by the mapped D TP rank — D's ROUTER binds
           ``side_channel_port + tp_rank`` (one per rank) but D advertises the
-          base port, so each P rank must send to ``base + tp_rank``.
+          base port. Multiple P ranks may therefore target the same D rank.
 
         ``remote_host`` / ``local_block_ids`` are already correct from
         ``build_connector_meta``; main and indexer group ids remain separate."""
@@ -523,6 +528,8 @@ class SFAPDCpuOffloadProducerWorker:
                     prefill_tp_rank=self.tp_rank,
                 )
                 tp_ratio = self.tp_size // remote_tp_size
+                req_meta.tp_ratio = tp_ratio
+                req_meta.group_member_idx = self.tp_rank % tp_ratio
                 old_remote_port = req_meta.remote_port
                 req_meta.remote_port = req_meta.remote_port + remote_tp_rank
                 _validate_tcp_port(

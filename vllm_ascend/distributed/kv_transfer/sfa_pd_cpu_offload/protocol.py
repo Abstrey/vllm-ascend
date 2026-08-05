@@ -82,6 +82,10 @@ class SfaPDProducerReqMeta:
     local_computed_tokens: int = 0
     local_transed_tokens: int = 0
     do_virtual: bool = False
+    # Unequal P/D TP maps tp_ratio P ranks to one D rank. This identifies the
+    # current P rank within that contributor group.
+    tp_ratio: int = 1
+    group_member_idx: int = 0
 
 
 class SfaPDProducerMetadata(KVConnectorMetadata):

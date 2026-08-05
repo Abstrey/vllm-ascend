@@ -591,6 +591,8 @@ def test_send_thread_wires_both_cache_group_block_lists():
         chunk_finish=True,
         local_transed_tokens=0,
         local_computed_tokens=32,
+        group_member_idx=0,
+        tp_ratio=1,
     )
 
     thread._process_send_task(
@@ -606,6 +608,8 @@ def test_send_thread_wires_both_cache_group_block_lists():
     assert sent_message[0] == READ_READY_BATCH
     assert sent_message[3] == [("req-0", [3, 4], [7], 0, 0)]
     assert sent_message[4] == ["req-0"]
+    assert sent_message[5] == 0
+    assert sent_message[6] == 1
 
 
 def test_send_thread_slices_each_group_at_chunk_boundaries():
@@ -646,6 +650,8 @@ def test_send_thread_slices_each_group_at_chunk_boundaries():
         chunk_finish=False,
         local_transed_tokens=16,
         local_computed_tokens=40,
+        group_member_idx=0,
+        tp_ratio=1,
     )
 
     thread._process_send_task(
@@ -659,6 +665,8 @@ def test_send_thread_slices_each_group_at_chunk_boundaries():
 
     sent_message = dealer.send.call_args.args[0]
     assert sent_message[3] == [("req-0", [11], [20], 1, 0)]
+    assert sent_message[5] == 0
+    assert sent_message[6] == 1
 
 
 @pytest.mark.parametrize("all_groups", [False, True])
@@ -971,6 +979,10 @@ def test_metaserver_callback_clears_completed_future():
         (8, 4, 0, 0),
         (8, 4, 3, 1),
         (8, 4, 7, 3),
+        (16, 4, 0, 0),
+        (16, 4, 3, 0),
+        (16, 4, 4, 1),
+        (16, 4, 15, 3),
     ],
 )
 def test_prefill_to_decode_tp_rank_mapping(p_tp, d_tp, p_rank, expected_d_rank):
@@ -1055,3 +1067,223 @@ def test_connector_shutdown_delegates_to_active_components():
 
     connector.connector_worker.shutdown.assert_called_once_with()
     connector.connector_scheduler.shutdown.assert_called_once_with()
+
+
+def _make_contributor_read_thread(
+    indexer_dest: list[int],
+    main_dest: list[int] | None = None,
+) -> MembPullReadThread:
+    thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread.tp_rank = 0
+    thread._state = ConsumerReadState(
+        num_blocks=64,
+        tp_size=1,
+        layer_metadata={},
+        main_name_to_idx={},
+        cpu_pools=[],
+        main_gva_bases=[],
+        main_block_lens=[],
+        indexer_tensors=[],
+        indexer_scale_tensors=[],
+        dest_blocks_by_req={"req-0": (main_dest or [], indexer_dest)},
+        get_offload_layer_id=lambda _: 0,
+    )
+    return thread
+
+
+def test_member_zero_pulls_main_and_first_indexer_slice():
+    thread = _make_contributor_read_thread(
+        [10, 11, 12, 13],
+        main_dest=[20, 21],
+    )
+
+    local, _, _, info = thread._build_req_descriptors(
+        _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000),
+        "req-0",
+        p_main_block_ids=[1, 2],
+        p_indexer_block_ids=[7, 8, 9, 10],
+        want_info=True,
+        group_member_idx=0,
+        ratio=2,
+    )
+
+    assert info is not None
+    assert info["n_main"] == 2
+    assert info["n_indexer"] == 2
+    assert info["d_indexer_ids"] == [10, 11]
+    assert 8050 in local
+    assert 8060 not in local
+
+
+def test_nonzero_member_skips_main_and_pulls_other_indexer_slice():
+    thread = _make_contributor_read_thread([10, 11, 12, 13])
+
+    local, _, _, info = thread._build_req_descriptors(
+        _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000),
+        "req-0",
+        p_main_block_ids=[1, 2],
+        p_indexer_block_ids=[7, 8, 9, 10],
+        want_info=True,
+        group_member_idx=1,
+        ratio=2,
+    )
+
+    assert info is not None
+    assert info["n_main"] == 0
+    assert info["n_indexer"] == 2
+    assert info["d_main_ids"] == []
+    assert info["d_indexer_ids"] == [12, 13]
+    assert 3000 not in local and 4000 not in local
+    assert 8060 in local
+
+
+def test_indexer_contributor_slices_are_disjoint_and_complete():
+    thread = _make_contributor_read_thread([10, 11, 12, 13])
+    layer = _make_layer(k_cpu_ptr=None, v_cpu_ptr=None)
+    covered: set[int] = set()
+
+    for member in range(4):
+        _, _, _, info = thread._build_req_descriptors(
+            layer,
+            "req-0",
+            p_main_block_ids=[],
+            p_indexer_block_ids=[7, 8, 9, 10],
+            want_info=True,
+            group_member_idx=member,
+            ratio=4,
+        )
+        assert info is not None
+        d_ids = set(info["d_indexer_ids"])
+        assert covered.isdisjoint(d_ids)
+        covered.update(d_ids)
+
+    assert covered == {10, 11, 12, 13}
+
+
+def test_contributor_with_empty_indexer_slice_is_valid_noop():
+    thread = _make_contributor_read_thread([10])
+
+    local, peer, lengths, info = thread._build_req_descriptors(
+        _make_layer(k_cpu_ptr=None, v_cpu_ptr=None),
+        "req-0",
+        p_main_block_ids=[],
+        p_indexer_block_ids=[7],
+        want_info=True,
+        group_member_idx=1,
+        ratio=2,
+    )
+
+    assert local == peer == lengths == []
+    assert info is not None
+    assert info["d_indexer_ids"] == []
+
+
+def test_ratio_one_keeps_full_transfer():
+    thread = _make_contributor_read_thread(
+        [10, 11, 12, 13],
+        main_dest=[20, 21],
+    )
+
+    _, _, _, info = thread._build_req_descriptors(
+        _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000),
+        "req-0",
+        p_main_block_ids=[1, 2],
+        p_indexer_block_ids=[7, 8, 9, 10],
+        want_info=True,
+    )
+
+    assert info is not None
+    assert info["n_main"] == 2
+    assert info["n_indexer"] == 4
+
+
+def _make_completion_thread() -> MembPullReadThread:
+    thread = MembPullReadThread.__new__(MembPullReadThread)
+    thread._done_requests = set()
+    thread._failed_requests = set()
+    thread._done_contributors = {}
+    thread._expected_ratio = {}
+    thread._lock = threading.Lock()
+    return thread
+
+
+def test_request_done_requires_all_contributors():
+    thread = _make_completion_thread()
+    for member in range(3):
+        thread._record_chunk_done(["req-0"], member, 4)
+    assert "req-0" not in thread._done_requests
+
+    thread._record_chunk_done(["req-0"], 3, 4)
+
+    assert "req-0" in thread._done_requests
+    assert "req-0" not in thread._done_contributors
+    assert "req-0" not in thread._expected_ratio
+
+
+def test_duplicate_contributor_does_not_complete_request():
+    thread = _make_completion_thread()
+    thread._record_chunk_done(["req-0"], 0, 3)
+    thread._record_chunk_done(["req-0"], 0, 3)
+    thread._record_chunk_done(["req-0"], 1, 3)
+
+    assert "req-0" not in thread._done_requests
+
+
+def test_ratio_one_completes_immediately():
+    thread = _make_completion_thread()
+    thread._record_chunk_done(["req-0"], 0, 1)
+
+    assert "req-0" in thread._done_requests
+
+
+def test_discard_requests_clears_partial_contributor_state():
+    thread = _make_completion_thread()
+    thread._record_chunk_done(["req-0"], 0, 4)
+
+    thread.discard_requests({"req-0"})
+
+    assert "req-0" not in thread._done_contributors
+    assert "req-0" not in thread._expected_ratio
+
+
+def test_cleanup_discards_partial_contributor_state():
+    worker = SFAPDCpuOffloadConsumerWorker.__new__(
+        SFAPDCpuOffloadConsumerWorker
+    )
+    worker._cpu_blocks_by_req = {"req-0-internal": 1}
+    worker.request_map = {"req-0": "req-0-internal"}
+    worker._dest_blocks_by_req = {"req-0": ([1], [2])}
+    worker._pending_done = {"req-0"}
+    worker._terminal_ext_ids = {"req-0"}
+    worker._mf_read_thread = MagicMock()
+
+    worker._cleanup_request_state({"req-0-internal"})
+
+    worker._mf_read_thread.discard_requests.assert_called_once_with({"req-0"})
+
+
+def test_start_load_sets_unequal_tp_contributor_identity():
+    worker = SFAPDCpuOffloadProducerWorker.__new__(
+        SFAPDCpuOffloadProducerWorker
+    )
+    worker._backend = BACKEND_MEMFABRIC
+    worker.tp_size = 16
+    worker.tp_rank = 7
+    req_meta = SimpleNamespace(
+        remote_port=12000,
+        remote_tp_size=4,
+        remote_host="127.0.0.1",
+        local_block_ids=[],
+        chunk_finish=False,
+        local_computed_tokens=0,
+        local_transed_tokens=0,
+    )
+
+    with patch.object(envs, "VLLM_ASCEND_SFA_DEBUG", False):
+        worker.start_load_kv(
+            SimpleNamespace(requests={"req-0": req_meta})
+        )
+
+    assert req_meta.remote_port == 12001
+    assert req_meta.tp_ratio == 4
+    assert req_meta.group_member_idx == 3

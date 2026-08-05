@@ -260,6 +260,11 @@ class MembPullSendingThread(threading.Thread):
         if endpoint_payloads:
             self.mark_layer_pending(layer_idx)
             self._pending_reads_by_layer[layer_idx] = len(endpoint_payloads)
+            # Contributor identity belongs to this P rank and is therefore the
+            # same for every request emitted by this send thread.
+            any_meta = next(iter(send_task.send_request.values()))
+            group_member_idx = any_meta.group_member_idx
+            tp_ratio = any_meta.tp_ratio
             for (remote_host, remote_port), (read_reqs, done_ext_ids) in endpoint_payloads.items():
                 path = make_zmq_path("tcp", remote_host, remote_port)
                 dealer = self._ensure_dealer(path)
@@ -267,7 +272,15 @@ class MembPullSendingThread(threading.Thread):
                     self._send_mf_meta(path, dealer, encoder)
                 dealer.send(
                     encoder.encode(
-                        (READ_READY_BATCH, layer_idx, layer_name, read_reqs, done_ext_ids)
+                        (
+                            READ_READY_BATCH,
+                            layer_idx,
+                            layer_name,
+                            read_reqs,
+                            done_ext_ids,
+                            group_member_idx,
+                            tp_ratio,
+                        )
                     )
                 )
                 if envs.VLLM_ASCEND_SFA_DEBUG:
