@@ -1122,6 +1122,7 @@ class AscendSFAKVOffloadImpl(AscendSFAImpl):
             visible_seq_lens_npu=full_kv_actual_seq,
             selection_membership_map=selection_membership_map,
             capturing=get_forward_context().capturing,
+            skip_topk=self.skip_topk,
         )
         if not external_plan_prepared:
             self._invalidate_fused_overlap_selection_rows(
