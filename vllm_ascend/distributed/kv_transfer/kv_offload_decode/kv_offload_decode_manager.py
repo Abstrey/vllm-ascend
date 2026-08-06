@@ -145,6 +145,12 @@ class KVOffloadDecodeManager:
             self.max_num_tokens,
             self.max_num_reqs * decode_width,
         )
+        self.fused_overlap_membership_map: torch.Tensor | None = None
+        self.fused_overlap_membership_map_rows = 0
+        self.fused_overlap_plan_owner_layer_id: int | None = None
+        self.fused_overlap_plan_topk: int | None = None
+        self.fused_overlap_plan_num_tokens = 0
+        self.fused_overlap_plan_membership_map: torch.Tensor | None = None
         max_block_num = cdiv(self.max_model_len, self.block_size)
         self.block_table_cpu = torch.zeros(
             [self.max_num_reqs, max_block_num],
@@ -338,6 +344,15 @@ class KVOffloadDecodeManager:
                 f"control_offset={FSA_SELECTION_MEMBERSHIP_CONTROL_OFFSET_INT16_COUNT}"
             )
 
+        if getattr(self, "fused_overlap_membership_map", None) is not None:
+            if row_capacity > self.fused_overlap_membership_map_rows:
+                raise RuntimeError(
+                    "fused_overlap membership storage was allocated for fewer "
+                    f"rows: allocated={self.fused_overlap_membership_map_rows}, "
+                    f"required={row_capacity}"
+                )
+            return self.fused_overlap_membership_map
+
         shape = [row_capacity, FSA_SELECTION_MEMBERSHIP_STORAGE_INT16_COUNT]
         owner_ptr = torch.zeros(1, dtype=torch.int64, device="npu")
         membership_map = None
@@ -368,6 +383,8 @@ class KVOffloadDecodeManager:
         if membership_map is None:
             raise RuntimeError("mapped membership storage was not initialized")
         self.tp_group.barrier()
+        self.fused_overlap_membership_map = membership_map
+        self.fused_overlap_membership_map_rows = row_capacity
         return membership_map
 
     def get_fused_overlap_cpu_kv_inputs(
@@ -992,6 +1009,7 @@ class KVOffloadDecodeManager:
         visible_seq_lens_npu: torch.Tensor,
         selection_membership_map: torch.Tensor,
         capturing: bool = False,
+        skip_topk: bool = False,
     ) -> bool:
         if not self.use_fused_overlap:
             raise RuntimeError("external FSA plan requires fused_overlap mode")
@@ -1049,6 +1067,28 @@ class KVOffloadDecodeManager:
             plan_start:required_columns,
         ]
         encoded_plan_stride = selection_membership_map.stride(0)
+
+        owner_layer_id = self.fused_overlap_plan_owner_layer_id
+        can_reuse_owner_plan = (
+            skip_topk
+            and owner_layer_id is not None
+            and layer_id > owner_layer_id
+            and self.fused_overlap_plan_topk == self.topk
+            and self.fused_overlap_plan_num_tokens == num_tokens
+            and self.fused_overlap_plan_membership_map is not None
+        )
+        if can_reuse_owner_plan:
+            owner_map = self.fused_overlap_plan_membership_map
+            if selection_membership_map.data_ptr() != owner_map.data_ptr():
+                if capturing:
+                    torch_npu.npu.current_stream().wait_stream(
+                        self.fused_plan_stream
+                    )
+                plan_storage.copy_(
+                    owner_map[:num_tokens, plan_start:required_columns],
+                    non_blocking=capturing,
+                )
+            return True
 
         def run_planner(enqueue: bool) -> None:
             planner = (
@@ -1111,6 +1151,10 @@ class KVOffloadDecodeManager:
                         non_blocking=True,
                     )
                 self.tp_group.broadcast(self.fused_plan_metadata_npu, src=0)
+            self.fused_overlap_plan_owner_layer_id = layer_id
+            self.fused_overlap_plan_topk = self.topk
+            self.fused_overlap_plan_num_tokens = num_tokens
+            self.fused_overlap_plan_membership_map = selection_membership_map
             return True
 
         planner_error = None
@@ -1146,6 +1190,10 @@ class KVOffloadDecodeManager:
                 "SFA fused_overlap external planner failed: "
                 f"layer={layer_name}, tp_rank={self.tp_rank}, {detail}"
             ) from planner_error
+        self.fused_overlap_plan_owner_layer_id = layer_id
+        self.fused_overlap_plan_topk = self.topk
+        self.fused_overlap_plan_num_tokens = num_tokens
+        self.fused_overlap_plan_membership_map = selection_membership_map
         return True
 
     def inject_current_kv_into_selection(
