@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -505,7 +506,8 @@ def test_owned_component_without_descriptors_still_fails():
     thread.engine.batch_transfer_sync_read.assert_not_called()
 
 
-def test_read_descriptor_rejects_missing_destination_blocks():
+def test_read_descriptor_rejects_missing_destination_blocks(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DEST_BLOCK_WAIT_TIMEOUT_SECONDS", "0")
     thread = _make_read_thread()
     thread._state.dest_blocks_by_req.clear()
 
@@ -518,6 +520,35 @@ def test_read_descriptor_rejects_missing_destination_blocks():
             want_info=False,
         )
 
+
+def test_read_descriptor_waits_for_late_destination_blocks(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DEST_BLOCK_WAIT_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_SFA_DEST_BLOCK_WAIT_INTERVAL_SECONDS", "0.001")
+    thread = _make_read_thread()
+    thread._state.dest_blocks_by_req.clear()
+    thread._stop_event = threading.Event()
+
+    def register_late_dest_blocks():
+        time.sleep(0.02)
+        thread._state.dest_blocks_by_req["req-0"] = ([3, 4], [])
+
+    register_thread = threading.Thread(target=register_late_dest_blocks)
+    register_thread.start()
+    try:
+        local, peer, lengths, info = thread._build_req_descriptors(
+            _make_layer(k_cpu_ptr=3000, v_cpu_ptr=4000, has_indexer=False),
+            "req-0",
+            p_main_block_ids=[1, 2],
+            p_indexer_block_ids=[],
+            want_info=True,
+        )
+    finally:
+        register_thread.join(timeout=1)
+
+    assert local == [3030, 4060]
+    assert peer == [1010, 2020]
+    assert lengths == [20, 40]
+    assert info is not None
 
 def test_read_descriptor_rejects_incomplete_indexer_transfer():
     thread = _make_read_thread()

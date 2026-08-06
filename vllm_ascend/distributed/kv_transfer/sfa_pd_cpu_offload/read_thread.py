@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+import time
 from typing import Any
 
 import msgspec
@@ -25,6 +27,27 @@ from vllm_ascend.distributed.kv_transfer.sfa_pd_cpu_offload.protocol import (
 
 READ_THREAD_POLL_TIMEOUT_MS = 100
 THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+DEST_BLOCK_WAIT_TIMEOUT_ENV = "VLLM_ASCEND_SFA_DEST_BLOCK_WAIT_TIMEOUT_SECONDS"
+DEST_BLOCK_WAIT_INTERVAL_ENV = "VLLM_ASCEND_SFA_DEST_BLOCK_WAIT_INTERVAL_SECONDS"
+
+
+def _read_float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using default %.3f", name, value, default)
+        return default
+
+
+def _dest_block_wait_timeout_seconds() -> float:
+    return max(0.0, _read_float_env(DEST_BLOCK_WAIT_TIMEOUT_ENV, 2.0))
+
+
+def _dest_block_wait_interval_seconds() -> float:
+    return max(0.0005, _read_float_env(DEST_BLOCK_WAIT_INTERVAL_ENV, 0.001))
 
 
 @dataclass
@@ -422,6 +445,39 @@ class MembPullReadThread(threading.Thread):
             "scale": scale,
         }
 
+    def _wait_for_dest_blocks(
+        self,
+        ext_req_id: str,
+        layer_name: str,
+    ) -> tuple[list[int], list[int]]:
+        state = self._state
+        dest = state.dest_blocks_by_req.get(ext_req_id)
+        if dest is not None:
+            return dest
+
+        timeout = _dest_block_wait_timeout_seconds()
+        deadline = time.monotonic() + timeout
+        interval = _dest_block_wait_interval_seconds()
+        stop_event = getattr(self, "_stop_event", None)
+
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
+            time.sleep(interval)
+            dest = state.dest_blocks_by_req.get(ext_req_id)
+            if dest is not None:
+                if envs.VLLM_ASCEND_SFA_DEBUG:
+                    logger.info(
+                        "MembPull D waited for destination blocks: req=%s, layer=%s",
+                        ext_req_id, layer_name,
+                    )
+                return dest
+
+        raise RuntimeError(
+            f"MembPull has no destination blocks on D for req {ext_req_id} "
+            f"(layer {layer_name})"
+        )
+
     def _build_req_descriptors(
         self,
         layer: dict[str, Any],
@@ -437,12 +493,7 @@ class MembPullReadThread(threading.Thread):
         state = self._state
         layer_name = layer["layer_name"]
 
-        dest = state.dest_blocks_by_req.get(ext_req_id)
-        if dest is None:
-            raise RuntimeError(
-                f"MembPull has no destination blocks on D for req {ext_req_id} "
-                f"(layer {layer_name})"
-            )
+        dest = self._wait_for_dest_blocks(ext_req_id, layer_name)
         all_d_main_ids, all_d_indexer_ids = dest
         # P sends the complete main block list from every contributor, but only
         # member 0 pulls it. Other members must not validate that destination.
