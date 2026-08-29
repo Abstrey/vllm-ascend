@@ -21,6 +21,8 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 
+from vllm_ascend.core.forward_time_collector import run_timed_draft_forward
+
 
 class AscendExtractHiddenStatesProposer(ExtractHiddenStatesProposer):
     """Ascend-adapted ExtractHiddenStatesProposer for NPU devices.
@@ -38,6 +40,23 @@ class AscendExtractHiddenStatesProposer(ExtractHiddenStatesProposer):
     def __init__(self, vllm_config: VllmConfig, device: torch.device, runner=None):
         self.runner = runner
         super().__init__(vllm_config, device)
+
+    def propose(self, *args, **kwargs):
+        """Business propose wrapped with async device timing (design doc §6.2).
+
+        Signature is passed through verbatim so upstream changes to
+        ``ExtractHiddenStatesProposer.propose`` cannot break this override.
+        The timing bracket covers the model call inside the upstream propose;
+        dummy/capture paths call ``self.model`` directly in ``dummy_run`` and
+        never reach here. (``upstream`` is bound first: zero-arg super() does
+        not work inside a nested callable.)
+        """
+        upstream = super()
+        return run_timed_draft_forward(
+            self.runner,
+            getattr(getattr(self.runner, "input_batch", None), "num_reqs", None),
+            lambda: upstream.propose(*args, **kwargs),
+        )
 
     @torch.inference_mode()
     def _determine_batch_execution_and_padding(

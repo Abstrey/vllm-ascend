@@ -47,6 +47,7 @@ from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
+from vllm_ascend.core.forward_time_collector import run_timed_draft_forward
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.models.deepseek_v4_dspark import DSparkDeepseekV4ForCausalLM
@@ -1072,12 +1073,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             runnable = cast(Callable[..., Any], self._runnable)
             run_draft: Callable[[], Any] = partial(runnable, **model_inputs)
+            # Phase is derived inside the shared helper from the runner's
+            # pre-overlay attention state (design doc §6.2): mixed batches
+            # must be reported as "mixed", not collapsed into "prefill".
+            timed_draft = partial(
+                run_timed_draft_forward,
+                self.runner,
+                self.runner.input_batch.num_reqs,
+            )
 
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
+                draft_token_ids = timed_draft(run_draft)
             else:
-                draft_token_ids = run_draft()
+                draft_token_ids = timed_draft(run_draft)
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 

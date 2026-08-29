@@ -40,7 +40,7 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method == "suffix":
         return AscendSuffixDecodingProposer(vllm_config, runner)
     elif method == "medusa":
-        return AscendMedusaProposer(vllm_config, device)
+        return AscendMedusaProposer(vllm_config, device, runner)
     elif method == "dspark":
         return AscendDSparkProposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3", "mtp"):
