@@ -22,6 +22,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
+from vllm_ascend.core.forward_time_collector import run_timed_draft_forward
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.utils import lmhead_tp_enable
@@ -507,11 +508,18 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
                 "is_prefill": attn_metadata_i.num_prefills,
             }
             run_draft = partial(self._runnable, **model_inputs)
+            # Phase is derived inside the shared helper from the runner's
+            # pre-overlay attention state (design doc §6.2).
+            timed_draft = partial(
+                run_timed_draft_forward,
+                self.runner,
+                self.runner.input_batch.num_reqs,
+            )
             if self.enable_enpu:
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
-                draft_token_ids = run_draft()
+                draft_token_ids = timed_draft(run_draft)
             else:
-                draft_token_ids = run_draft()
+                draft_token_ids = timed_draft(run_draft)
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         return draft_token_ids
 

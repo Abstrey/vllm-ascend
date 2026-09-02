@@ -130,6 +130,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.core.forward_time_collector import ForwardTimeCollector, derive_target_phase, run_timed_forward
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import init_kv_offload_decode_manager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_gva_layerwise_config,
@@ -497,6 +498,14 @@ class NPUModelRunner(GPUModelRunner):
         self.decode_threshold = 1 + (self.speculative_config.num_speculative_tokens if self.speculative_config else 0)
 
         self.use_aclgraph = self._use_aclgraph()
+
+        # Async device forward time metrics (design: develop/模型forward异步打点.md).
+        # additional-config is primary (pickled into VllmConfig, reaches
+        # spawn'd workers); from_config falls back to env vars for non-spawn
+        # paths and returns None when disabled, so no collector is created.
+        self.forward_time_collector = ForwardTimeCollector.from_config(
+            self.ascend_config.forward_time_metrics_config, vllm_config.parallel_config.rank
+        )
 
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
@@ -1525,6 +1534,11 @@ class NPUModelRunner(GPUModelRunner):
             self.attn_state = AscendAttentionState.ChunkedPrefill  # type: ignore
         else:
             self.attn_state = attn_state  # type: ignore
+        # Un-overwritten state that feeds the attention metadata. Forward time
+        # metrics must read this one: for non-MTP speculative decoding the
+        # overlay above rewrites self.attn_state to ChunkedPrefill during
+        # verify steps (design doc §6.1).
+        self.metadata_attn_state = attn_state
 
         return attn_state
 
@@ -2369,8 +2383,11 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            hidden_states = self._timed_model_forward(
+                scheduler_output,
+                lambda: self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                ),
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2908,6 +2925,32 @@ class NPUModelRunner(GPUModelRunner):
                 self.speculative_config,
                 positions.shape[0],
             )
+
+    def _timed_model_forward(self, scheduler_output: "SchedulerOutput", run_forward: Callable[[], Any]):
+        """Business-path forward with async device timing (design doc §6.1).
+
+        The caller injects ``run_forward``, a zero-arg callable that runs the
+        model forward; this wrapper owns only the timing identity (role, phase,
+        batch size) and the fail-open guard. Only ``execute_model`` routes
+        through here, so the capture/warmup/profile paths — which invoke the
+        model forward directly — never enter business statistics. Fail-open:
+        instrumentation must never mask or replace a model exception, skip the
+        forward, or turn a successful forward into a failure (guaranteed by
+        ``run_timed_forward``).
+        """
+        collector = self.forward_time_collector
+        if collector is None:
+            return run_forward()
+        return run_timed_forward(
+            collector,
+            "target",
+            lambda: derive_target_phase(
+                getattr(self, "metadata_attn_state", None),
+                scheduler_output.scheduled_spec_decode_tokens,
+            ),
+            self.input_batch.num_reqs,
+            run_forward,
+        )
 
     def _model_forward(
         self,
@@ -5440,6 +5483,22 @@ class NPUModelRunner(GPUModelRunner):
             set_graph_params(capture_sizes)
             if self.speculative_config:
                 set_draft_graph_params(capture_sizes)
+
+    def shutdown(self) -> None:
+        """Teardown hook; ``NPUWorker.shutdown`` forwards here (design doc §7.4).
+
+        Flushes the tail windows of forward time metrics: unfinished pending
+        samples are counted as dropped, partial windows are still logged.
+        Then delegates to the base class so the upstream cleanup (model
+        weights release, workspace reset, static forward context and RoPE
+        cache clearing) keeps running exactly as it did before this
+        override existed — even if the metrics flush itself fails.
+        """
+        try:
+            if self.forward_time_collector is not None:
+                self.forward_time_collector.flush_window(final=True)
+        finally:
+            super().shutdown()
 
     def capture_model(self) -> int:
         """Capture NPU graphs and return actual graph pool memory bytes consumed."""

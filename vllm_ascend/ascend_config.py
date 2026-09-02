@@ -289,6 +289,10 @@ class AscendConfig:
         )
         self._validate_sparse_c8_kv_offload_compatibility()
 
+        self.forward_time_metrics_config = ForwardTimeMetricsConfig(
+            additional_config.get("forward_time_metrics_config", {})
+        )
+
     def _validate_sparse_c8_kv_offload_compatibility(self) -> None:
         if self.kv_offload_decode_config.enabled and self.enable_sparse_sfa_c8:
             raise NotImplementedError(
@@ -649,6 +653,48 @@ class ProfilingChunkConfig:
             raise ValueError(f"profiling_chunk_config.min_chunk must be positive, got {self.min_chunk}")
         if self.max_fit_chunk <= 5:
             raise ValueError(f"Recommend to use at least 30 data points for fitting, got {self.max_fit_chunk}")
+
+
+class ForwardTimeMetricsConfig:
+    """Configuration for async device forward time metrics.
+
+    Timed NPU events are recorded around each model forward and aggregated
+    per (rank, model role, phase, batch size) window (design:
+    develop/模型forward异步打点.md). This must be configured through
+    ``additional_config`` rather than env vars: the value is pickled into
+    ``VllmConfig`` and reaches spawn'd workers reliably, while raw env vars
+    are filtered out of the engine-core spawn environment.
+
+    Usage (online)::
+
+        vllm serve <model> --additional-config '{"forward_time_metrics_config": {"enabled": true}}'
+
+    Optional fields: ``window_size`` (default 1000) and ``target_batch_sizes``
+    (list of positive ints; empty means all batch sizes).
+    """
+
+    def __init__(self, config: dict | None = None):
+        if config is None:
+            config = {}
+        self.enabled: bool = bool(config.get("enabled", False))
+        self.window_size: int = int(config.get("window_size", 1000))
+        self.target_batch_sizes: tuple[int, ...] = tuple(
+            int(bs) for bs in config.get("target_batch_sizes", [])
+        )
+        self._validate()
+
+    def _validate(self):
+        if not self.enabled:
+            return
+        if self.window_size <= 0:
+            raise ValueError(
+                f"forward_time_metrics_config.window_size must be positive, got {self.window_size}"
+            )
+        if any(bs <= 0 for bs in self.target_batch_sizes):
+            raise ValueError(
+                "forward_time_metrics_config.target_batch_sizes must be positive, "
+                f"got {self.target_batch_sizes}"
+            )
 
 
 class BatchJobSchedConfig:

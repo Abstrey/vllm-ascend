@@ -138,6 +138,23 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable non-sensitive MemFabric KV checksum verification. 0 disables it
     # (default); 1 enables it and incurs device-to-host synchronization.
     "VLLM_ASCEND_MF_VERIFY": lambda: bool(int(os.getenv("VLLM_ASCEND_MF_VERIFY", "0"))),
+    # Whether to enable async device forward time metrics. When enabled, a pair
+    # of NPU timing events is recorded around each model forward and aggregated
+    # per (rank, model role, phase, batch size) window. 0 disables it (default).
+    # Non-sensitive.
+    "VLLM_ASCEND_ENABLE_FORWARD_TIME_METRICS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_FORWARD_TIME_METRICS", "0"))
+    ),
+    # Number of accepted forwards per statistics window for forward time
+    # metrics. Must be a positive integer. If not set, the default is 1000.
+    # Non-sensitive.
+    "VLLM_ASCEND_FORWARD_TIME_WINDOW_SIZE": lambda: int(os.getenv("VLLM_ASCEND_FORWARD_TIME_WINDOW_SIZE", "1000")),
+    # Comma-separated target batch sizes for forward time metrics. Empty (the
+    # default) means all batch sizes are collected. Entries must be positive
+    # integers. Non-sensitive.
+    "VLLM_ASCEND_FORWARD_TIME_TARGET_BATCH_SIZES": lambda: os.getenv(
+        "VLLM_ASCEND_FORWARD_TIME_TARGET_BATCH_SIZES", ""
+    ),
 }
 
 # end-env-vars-definition
