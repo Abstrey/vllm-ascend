@@ -709,7 +709,6 @@ def test_run_timed_draft_forward_runs_draft_when_start_raises():
     runner = SimpleNamespace(
         forward_time_collector=collector,
         input_batch=SimpleNamespace(num_reqs=3),
-        _draft_time_phase=lambda: "decode",
     )
     run_draft = MagicMock(return_value="draft_ids")
 
@@ -731,3 +730,48 @@ def test_emit_log_failure_does_not_break_emission():
     by_key = summaries_by_key(summaries)
     assert by_key[("target", "decode", 4)].count == 1
     assert by_key[("target", "decode", 8)].count == 1
+
+
+# --------------------------------------------------------------------- #
+# from_config: additional-config primary, env fallback, disabled -> None
+# --------------------------------------------------------------------- #
+
+
+def test_from_config_returns_none_when_all_disabled(monkeypatch):
+    monkeypatch.setattr(
+        ForwardTimeConfig, "from_env", staticmethod(lambda: ForwardTimeConfig(enabled=False))
+    )
+    cfg = SimpleNamespace(enabled=False, window_size=1000, target_batch_sizes=())
+    assert ForwardTimeCollector.from_config(cfg, RANK) is None
+
+
+def test_from_config_uses_additional_config_when_enabled(monkeypatch):
+    # from_env must not be consulted: a raising sentinel proves short-circuit.
+    def _boom():
+        raise AssertionError("from_env called while additional-config is enabled")
+
+    monkeypatch.setattr(ForwardTimeConfig, "from_env", staticmethod(_boom))
+    cfg = SimpleNamespace(enabled=True, window_size=42, target_batch_sizes=(4, 5))
+    collector = ForwardTimeCollector.from_config(cfg, RANK)
+    assert collector is not None
+    assert collector._window_size == 42
+    assert collector._target_bs == frozenset({4, 5})
+
+
+def test_from_config_falls_back_to_env_when_config_disabled(monkeypatch):
+    monkeypatch.setattr(
+        ForwardTimeConfig,
+        "from_env",
+        staticmethod(lambda: ForwardTimeConfig(enabled=True, window_size=7)),
+    )
+    cfg = SimpleNamespace(enabled=False, window_size=1000, target_batch_sizes=())
+    collector = ForwardTimeCollector.from_config(cfg, RANK)
+    assert collector is not None
+    assert collector._window_size == 7
+
+
+def test_from_config_treats_none_as_disabled_config(monkeypatch):
+    monkeypatch.setattr(
+        ForwardTimeConfig, "from_env", staticmethod(lambda: ForwardTimeConfig(enabled=False))
+    )
+    assert ForwardTimeCollector.from_config(None, RANK) is None

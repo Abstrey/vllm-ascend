@@ -30,6 +30,7 @@ import pytest
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_ascend.ascend_config import ForwardTimeMetricsConfig
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.core.forward_time_collector import derive_draft_phase, derive_target_phase
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
@@ -56,7 +57,7 @@ def test_decode_step_uses_real_num_reqs():
     runner = make_runner(
         metadata_attn_state=AscendAttentionState.DecodeOnly, num_reqs=7, collector=collector
     )
-    result = runner._timed_model_forward(sched_output(), 16)
+    result = runner._timed_model_forward(sched_output(), lambda: runner._model_forward())
     assert result == "hidden_states"
     collector.start.assert_called_once_with("target", "decode", 7)
     collector.finish.assert_called_once_with(collector.start.return_value)
@@ -88,8 +89,7 @@ def test_decode_step_uses_real_num_reqs():
     ],
 )
 def test_phase_mapping(state, spec_tokens, expected):
-    runner = make_runner(metadata_attn_state=state)
-    assert runner._forward_time_phase(sched_output(spec_tokens)) == expected
+    assert derive_target_phase(state, spec_tokens) == expected
 
 
 # --------------------------------------------------------------------- #
@@ -112,13 +112,9 @@ def test_phase_mapping(state, spec_tokens, expected):
     ],
 )
 def test_draft_phase_mapping(state, expected):
-    runner = make_runner(metadata_attn_state=state)
-    assert runner._draft_time_phase() == expected
-
-
-def test_draft_phase_defaults_to_mixed_without_state_attr():
-    runner = object.__new__(NPUModelRunner)  # metadata_attn_state never set
-    assert runner._draft_time_phase() == "mixed"
+    # The parametrized None row already covers the missing-state default; the
+    # runner-without-attribute path is exercised via run_timed_draft_forward.
+    assert derive_draft_phase(state) == expected
 
 
 # --------------------------------------------------------------------- #
@@ -133,7 +129,7 @@ def test_forward_exception_aborts_and_reraises():
     )
     runner._model_forward = MagicMock(side_effect=RuntimeError("model boom"))
     with pytest.raises(RuntimeError, match="model boom"):
-        runner._timed_model_forward(sched_output(), 16)
+        runner._timed_model_forward(sched_output(), lambda: runner._model_forward())
     collector.start.assert_called_once()
     collector.abort.assert_called_once_with(collector.start.return_value)
     collector.finish.assert_not_called()
@@ -146,7 +142,7 @@ def test_forward_runs_when_collector_start_raises():
     runner = make_runner(
         metadata_attn_state=AscendAttentionState.DecodeOnly, collector=collector
     )
-    result = runner._timed_model_forward(sched_output(), 16)
+    result = runner._timed_model_forward(sched_output(), lambda: runner._model_forward())
     assert result == "hidden_states"
     runner._model_forward.assert_called_once()
     collector.finish.assert_not_called()
@@ -162,7 +158,7 @@ def test_forward_exception_preserved_when_abort_raises():
     )
     runner._model_forward = MagicMock(side_effect=RuntimeError("model boom"))
     with pytest.raises(RuntimeError, match="model boom"):
-        runner._timed_model_forward(sched_output(), 16)
+        runner._timed_model_forward(sched_output(), lambda: runner._model_forward())
     collector.abort.assert_called_once()
 
 
@@ -174,7 +170,7 @@ def test_forward_result_returned_when_finish_raises():
     runner = make_runner(
         metadata_attn_state=AscendAttentionState.DecodeOnly, collector=collector
     )
-    assert runner._timed_model_forward(sched_output(), 16) == "hidden_states"
+    assert runner._timed_model_forward(sched_output(), lambda: runner._model_forward()) == "hidden_states"
     collector.finish.assert_called_once()
 
 
@@ -185,7 +181,7 @@ def test_forward_result_returned_when_finish_raises():
 
 def test_disabled_collector_is_passthrough():
     runner = make_runner(metadata_attn_state=AscendAttentionState.DecodeOnly, collector=None)
-    result = runner._timed_model_forward(sched_output(), 16)
+    result = runner._timed_model_forward(sched_output(), lambda: runner._model_forward())
     assert result == "hidden_states"
     runner._model_forward.assert_called_once()
 
@@ -287,8 +283,11 @@ def test_only_execute_model_is_instrumented():
     # must never enter business statistics.
     assert "_timed_model_forward" not in dummy_src
     assert "_timed_model_forward" not in forward_src
-    # The wrapper itself delegates to _model_forward exactly once per path.
-    assert timed_src.count("self._model_forward(") == 2  # disabled path + timed path
+    # The wrapper delegates only via the injected callable; the single model
+    # forward reference lives in execute_model's call-site lambda, not here.
+    assert timed_src.count("self._model_forward(") == 0
+    assert "run_forward()" in timed_src
+    assert execute_src.count("self._model_forward(") == 1
 
     # The pre-overlay attention state must stay exposed for phase mapping.
     build_src = inspect.getsource(NPUModelRunner._build_attn_state)

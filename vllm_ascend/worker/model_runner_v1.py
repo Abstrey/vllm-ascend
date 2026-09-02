@@ -130,7 +130,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
-from vllm_ascend.core.forward_time_collector import ForwardTimeCollector, ForwardTimeConfig, run_timed_forward
+from vllm_ascend.core.forward_time_collector import ForwardTimeCollector, derive_target_phase, run_timed_forward
 from vllm_ascend.distributed.kv_transfer.kv_offload_decode.kv_offload_decode_manager import init_kv_offload_decode_manager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_config import (
     get_gva_layerwise_config,
@@ -500,22 +500,12 @@ class NPUModelRunner(GPUModelRunner):
         self.use_aclgraph = self._use_aclgraph()
 
         # Async device forward time metrics (design: develop/模型forward异步打点.md).
-        # additional-config is the primary source: it is pickled into
-        # VllmConfig and reaches spawn'd workers reliably, while raw env vars
-        # are filtered out of the engine-core spawn environment. Env vars stay
-        # as a fallback for non-spawn paths (offline LLM, tests).
-        forward_time = self.ascend_config.forward_time_metrics_config
-        if not forward_time.enabled:
-            env_fallback = ForwardTimeConfig.from_env()
-            if env_fallback.enabled:
-                forward_time = env_fallback
-        self.forward_time_collector: ForwardTimeCollector | None = None
-        if forward_time.enabled:
-            self.forward_time_collector = ForwardTimeCollector(
-                rank=vllm_config.parallel_config.rank,
-                window_size=forward_time.window_size,
-                target_batch_sizes=forward_time.target_batch_sizes,
-            )
+        # additional-config is primary (pickled into VllmConfig, reaches
+        # spawn'd workers); from_config falls back to env vars for non-spawn
+        # paths and returns None when disabled, so no collector is created.
+        self.forward_time_collector = ForwardTimeCollector.from_config(
+            self.ascend_config.forward_time_metrics_config, vllm_config.parallel_config.rank
+        )
 
         eplb_config = self.ascend_config.eplb_config
         self.dynamic_eplb = eplb_config.dynamic_eplb
@@ -2395,7 +2385,9 @@ class NPUModelRunner(GPUModelRunner):
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._timed_model_forward(
                 scheduler_output,
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                lambda: self._model_forward(
+                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                ),
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2934,74 +2926,30 @@ class NPUModelRunner(GPUModelRunner):
                 positions.shape[0],
             )
 
-    def _forward_time_phase(self, scheduler_output: "SchedulerOutput") -> str:
-        """Map the current business step to a forward-time phase (design doc §6.1).
-
-        Reads the pre-overlay ``metadata_attn_state``: the non-MTP PCP/Eagle
-        overlay rewrites ``self.attn_state`` to ChunkedPrefill during verify
-        steps, and MTP + PD-disagg can mark pure seq_len=1 decode steps as
-        SpecDecoding without scheduled draft tokens.
-        """
-        attn_state = getattr(self, "metadata_attn_state", None)
-        if attn_state == AscendAttentionState.SpecDecoding:
-            # Draft tokens actually scheduled for the target model -> verify;
-            # without them this is a pure decode step.
-            return "verify" if scheduler_output.scheduled_spec_decode_tokens else "decode"
-        if attn_state == AscendAttentionState.DecodeOnly:
-            return "decode"
-        if attn_state == AscendAttentionState.ChunkedPrefill:
-            return "mixed"
-        return "prefill"
-
-    def _draft_time_phase(self) -> str:
-        """Phase label for draft forwards (design doc §6.2).
-
-        Derived from the same pre-overlay attention state as the target
-        mapping so both roles share one vocabulary: draft generation on
-        decode/verify steps is "decode", prefill-only states are "prefill",
-        and chunked-prefill batches (which may mix prefill and decode
-        requests) plus anything unclassifiable are "mixed" — never
-        misreported as decode or prefill.
-        """
-        state = getattr(self, "metadata_attn_state", None)
-        if state in (AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding):
-            return "decode"
-        if state in (AscendAttentionState.PrefillNoCache, AscendAttentionState.PrefillCacheHit):
-            return "prefill"
-        return "mixed"
-
-    def _timed_model_forward(
-        self,
-        scheduler_output: "SchedulerOutput",
-        num_tokens_padded: int,
-        input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-        **model_kwargs: dict[str, Any],
-    ):
+    def _timed_model_forward(self, scheduler_output: "SchedulerOutput", run_forward: Callable[[], Any]):
         """Business-path forward with async device timing (design doc §6.1).
 
-        Only ``execute_model`` routes through here; ``_dummy_run`` calls
-        ``_model_forward`` directly so capture/warmup/profile runs never
-        enter business statistics. Fail-open: instrumentation must never
-        mask or replace a model exception, skip the forward, or turn a
-        successful forward into a failure (guaranteed by
+        The caller injects ``run_forward``, a zero-arg callable that runs the
+        model forward; this wrapper owns only the timing identity (role, phase,
+        batch size) and the fail-open guard. Only ``execute_model`` routes
+        through here, so the capture/warmup/profile paths — which invoke the
+        model forward directly — never enter business statistics. Fail-open:
+        instrumentation must never mask or replace a model exception, skip the
+        forward, or turn a successful forward into a failure (guaranteed by
         ``run_timed_forward``).
         """
         collector = self.forward_time_collector
         if collector is None:
-            return self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
+            return run_forward()
         return run_timed_forward(
             collector,
             "target",
-            lambda: self._forward_time_phase(scheduler_output),
-            self.input_batch.num_reqs,
-            lambda: self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            lambda: derive_target_phase(
+                getattr(self, "metadata_attn_state", None),
+                scheduler_output.scheduled_spec_decode_tokens,
             ),
+            self.input_batch.num_reqs,
+            run_forward,
         )
 
     def _model_forward(

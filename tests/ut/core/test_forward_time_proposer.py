@@ -27,15 +27,24 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.core.forward_time_collector import run_timed_draft_forward
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
+
+# A draft phase is now derived from the runner's attention state, so these
+# doubles supply the state whose derive_draft_phase mapping yields `phase`.
+_PHASE_TO_STATE = {
+    "decode": AscendAttentionState.DecodeOnly,
+    "prefill": AscendAttentionState.PrefillNoCache,
+    "mixed": AscendAttentionState.ChunkedPrefill,
+}
 
 
 def make_runner(collector, num_reqs=5, phase="decode"):
     return SimpleNamespace(
         forward_time_collector=collector,
         input_batch=SimpleNamespace(num_reqs=num_reqs),
-        _draft_time_phase=lambda: phase,
+        metadata_attn_state=_PHASE_TO_STATE[phase],
     )
 
 
@@ -58,8 +67,9 @@ def test_run_timed_draft_forward_records_role_phase_bs():
 
 
 def test_run_timed_draft_forward_derives_phase_from_runner():
-    # The wrapper never guesses the phase: it comes from the runner's
-    # _draft_time_phase so draft and target share one vocabulary.
+    # The wrapper never guesses the phase: it derives it from the runner's
+    # pre-overlay attention state (derive_draft_phase), so draft and target
+    # share one vocabulary.
     collector = MagicMock()
     runner = make_runner(collector, num_reqs=2, phase="mixed")
     run_timed_draft_forward(runner, 2, MagicMock())
@@ -67,8 +77,9 @@ def test_run_timed_draft_forward_derives_phase_from_runner():
 
 
 def test_run_timed_draft_forward_falls_back_to_mixed_phase():
-    # A runner without _draft_time_phase (older runner, bare test doubles)
-    # must be reported as mixed, never as decode (design doc §6.2).
+    # A runner without metadata_attn_state (older runner, bare test doubles)
+    # reads as None and must be reported as mixed, never as decode
+    # (design doc §6.2).
     collector = MagicMock()
     runner = SimpleNamespace(forward_time_collector=collector)
     run_timed_draft_forward(runner, 3, MagicMock())

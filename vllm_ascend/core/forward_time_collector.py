@@ -186,6 +186,33 @@ class ForwardTimeConfig:
 class ForwardTimeCollector:
     """Single-rank collector; one instance per worker, no locks (single-threaded caller)."""
 
+    @classmethod
+    def from_config(cls, config: Any, rank: int) -> ForwardTimeCollector | None:
+        """Resolve forward-time metrics config and build a collector, or None.
+
+        The parsed ``additional-config`` value is primary: it is pickled into
+        ``VllmConfig`` and reaches spawn'd workers, while raw env vars are
+        filtered out of the engine-core spawn environment. When it is absent or
+        disabled, fall back to the env-parsed config so non-spawn paths
+        (offline ``LLM``, tests) still honour the env vars. Returns ``None``
+        when the feature is off, so the caller creates no collector.
+
+        ``config`` is duck-typed: any object exposing ``enabled`` /
+        ``window_size`` / ``target_batch_sizes`` is accepted (the additional
+        ``ForwardTimeMetricsConfig`` dataclass and :class:`ForwardTimeConfig`
+        share those fields). This deliberately avoids importing
+        ``AscendConfig``/``ForwardTimeMetricsConfig`` here, mirroring the
+        module's lazy-dependency policy.
+        """
+        effective = config if config is not None and config.enabled else ForwardTimeConfig.from_env()
+        if not effective.enabled:
+            return None
+        return cls(
+            rank=rank,
+            window_size=effective.window_size,
+            target_batch_sizes=effective.target_batch_sizes,
+        )
+
     def __init__(
         self,
         rank: int,
@@ -516,6 +543,68 @@ def _warn_instrumentation_failure(op: str, exc: BaseException) -> None:
         pass
 
 
+_ASCEND_ATTN_STATE: Any = None
+
+
+def _ascend_attn_state() -> Any:
+    """Lazily resolve and cache ``AscendAttentionState``.
+
+    Imported on first use rather than at module import, mirroring
+    :meth:`ForwardTimeConfig.from_env`'s lazy ``envs`` import, so this module
+    stays off the heavy top-level import graph. Cached in a module global so
+    the per-forward hot path pays only an identity check, not an import, after
+    the first call.
+    """
+    global _ASCEND_ATTN_STATE
+    if _ASCEND_ATTN_STATE is None:
+        from vllm_ascend.attention.attention_v1 import AscendAttentionState
+
+        _ASCEND_ATTN_STATE = AscendAttentionState
+    return _ASCEND_ATTN_STATE
+
+
+def derive_target_phase(attn_state: Any, spec_tokens: Any) -> ForwardPhase:
+    """Map a business step to the target model's forward-time phase (§6.1).
+
+    Pure: it receives the pre-overlay ``metadata_attn_state`` value and the raw
+    ``scheduled_spec_decode_tokens`` mapping — never the runner or scheduler
+    object — so the collector holds no reference to either (design §7.2). The
+    non-MTP PCP/Eagle overlay rewrites ``self.attn_state`` to ChunkedPrefill
+    during verify steps, and MTP + PD-disagg can mark pure seq_len=1 decode
+    steps as SpecDecoding without scheduled draft tokens; hence the pre-overlay
+    state plus the draft-token check. An ``attn_state`` of ``None`` (state not
+    yet built) falls through to "prefill".
+    """
+    state = _ascend_attn_state()
+    if attn_state == state.SpecDecoding:
+        # Draft tokens actually scheduled for the target model -> verify;
+        # without them this is a pure decode step.
+        return "verify" if spec_tokens else "decode"
+    if attn_state == state.DecodeOnly:
+        return "decode"
+    if attn_state == state.ChunkedPrefill:
+        return "mixed"
+    return "prefill"
+
+
+def derive_draft_phase(attn_state: Any) -> ForwardPhase:
+    """Phase label for draft forwards (design doc §6.2).
+
+    Pure mapping from the same pre-overlay attention state the target uses, so
+    draft and target share one vocabulary: draft generation on decode/verify
+    steps is "decode", prefill-only states are "prefill", and chunked-prefill
+    batches (which may mix prefill and decode requests) plus anything
+    unclassifiable — including a missing/``None`` state — are "mixed", never
+    misreported as decode or prefill.
+    """
+    state = _ascend_attn_state()
+    if attn_state in (state.DecodeOnly, state.SpecDecoding):
+        return "decode"
+    if attn_state in (state.PrefillNoCache, state.PrefillCacheHit):
+        return "prefill"
+    return "mixed"
+
+
 def run_timed_forward(
     collector: "ForwardTimeCollector",
     role: ModelRole,
@@ -579,16 +668,19 @@ def run_timed_draft_forward(runner: Any, num_reqs: int | None, run_draft: Callab
     the model calls there cannot be split off.
 
     The phase label is derived from the runner's pre-overlay attention state
-    (``NPUModelRunner._draft_time_phase``) so draft and target share one
-    vocabulary; a runner without that helper falls back to ``mixed`` per
-    design doc §6.2 ("never misreport as decode"). Fail-open: a missing
-    collector, an unknown runner shape or any collector failure must not
-    disturb the draft path (guarding lives in :func:`run_timed_forward`).
+    (:func:`derive_draft_phase`) so draft and target share one vocabulary; a
+    runner without ``metadata_attn_state`` yields ``None`` and falls back to
+    ``mixed`` per design doc §6.2 ("never misreport as decode"). Fail-open: a
+    missing collector, an unknown runner shape or any collector failure must
+    not disturb the draft path (guarding lives in :func:`run_timed_forward`).
     """
     collector = getattr(runner, "forward_time_collector", None)
     if collector is None or num_reqs is None:
         return run_draft()
-    phase_fn = getattr(runner, "_draft_time_phase", None)
-    if not callable(phase_fn):
-        phase_fn = lambda: "mixed"  # noqa: E731  (design doc §6.2 fallback)
-    return run_timed_forward(collector, "draft", phase_fn, num_reqs, run_draft)
+    return run_timed_forward(
+        collector,
+        "draft",
+        lambda: derive_draft_phase(getattr(runner, "metadata_attn_state", None)),
+        num_reqs,
+        run_draft,
+    )
