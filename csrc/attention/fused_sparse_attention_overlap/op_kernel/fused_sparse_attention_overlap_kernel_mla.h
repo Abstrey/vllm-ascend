@@ -21,7 +21,7 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "lib/matmul_intf.h"
 #include "lib/matrix/matmul/tiling.h"
-#include "../fused_sparse_attention_overlap_common.h"
+#include "fused_sparse_attention_overlap_common.h"
 #include "fused_sparse_attention_overlap_service_cube_mla.h"
 #include "fused_sparse_attention_overlap_service_vector_mla.h"
 
@@ -30,30 +30,29 @@ using AscendC::CacheMode;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
-// RunInfo is not populated before the S2 loop, so TempLoopInfo temporarily stores B-, N-, and S1-axis
-// information while avoiding redundant calculations.
+// 由于S2循环前，RunInfo还没有赋值，使用Bngs1Param临时存放B、N、S1轴相关的信息；同时减少重复计�?
 struct TempLoopInfo {
     uint32_t bn2IdxInCurCore = 0;
     uint32_t bIdx = 0U;
     uint32_t n2Idx = 0U;
-    uint64_t s2BasicSizeTail = 0U; // Tail base-block size for the S2 loop
-    uint32_t s2LoopTimes = 0U;     // Actual number of S2 loops for both TND and BXXD; no subtraction is needed
+    uint64_t s2BasicSizeTail = 0U; // S2方向循环的尾基本块大�?
+    uint32_t s2LoopTimes = 0U;     // S2方向循环的总次数，无论TND还是BXXD都是等于实际次数，不用减1
     uint64_t curActualSeqLen = 0ULL;
     uint64_t curActualSeqLenOri = 0ULL;
     bool curActSeqLenIsZero = false;
     int32_t nextTokensPerBatch = 0;
 
-    uint64_t actS1Size = 1ULL;     // S1-axis size processed by the current batch loop for TND
+    uint64_t actS1Size = 1ULL;     // TND场景下当前Batch循环处理的S1轴的大小
     uint32_t tndCoreStartKVSplitPos;
     bool tndIsS2SplitCore;
 
     uint32_t gS1Idx = 0U;
-    uint64_t mBasicSizeTail = 0U;  // Tail base-block size for the gS1 loop
+    uint64_t mBasicSizeTail = 0U;  // gS1方向循环的尾基本块大�?
 };
 
 template <typename FusedSparseAttentionOverlapTraits> class FusedSparseAttentionOverlapMla {
 public:
-    // Use float for intermediate computations in high-precision mode.
+    // 中间计算数据类型为float，高精度模式
     using T = float;
     using Q_T = typename FusedSparseAttentionOverlapTraits::queryType;
     using KV_T = typename FusedSparseAttentionOverlapTraits::kvType;
@@ -132,6 +131,28 @@ private:
     uint32_t tmpBlockIdx = 0U;
     uint32_t aiCoreIdx = 0U;
     uint32_t usedCoreNum = 0U;
+    // helper：空闲 AICore 的 V0/V1 帮搬 MergeKv（仅 V_TEMPLATE 启用）
+    bool isHelperAiCore_ = false;
+    uint32_t numHelpers_ = 0U;          // 参与帮忙的空闲核数（0 = 功能整体关闭）
+    uint32_t helperTargetAiCoreIdx_ = 0U;
+    uint32_t helperPartIdx_ = 0U;
+    uint32_t helperPartCount_ = 1U;
+    // helper-extend：bs>24 波次调度（任务 t=24w+i 步进映射，尾波 r∈[1,12] 开 1:1 helper）。
+    // 波次状态打包（active ⇔ pack!=0；高 27 位=满波数 k，低 5 位=尾波数 r）：从 7 个成员
+    // （~40B 含 GlobalTensor）收敛到 4B —— 成员占位实测劣化（见下方教训注释）。
+    // ⚠ 波次总开关（2026-09-03 集中测试口径）：false = 大 batch 波次泛化整体关门，
+    //   只保留 bs≤12 的 1:1 helper（下方 legacy 全覆盖条件天然给出该档位）。
+    //   helperExtPack_ 恒 0，Process 统一循环退化回 legacy 单段。恢复波次只翻这一个 bool。
+    static constexpr bool HELPER_EXT_ENABLE = false;
+    static constexpr uint32_t HELPER_EXT_MAX_WAVES = 8U;   // 覆盖 totalBaseNum<=192，超出回退连续切块
+    static constexpr uint32_t HELPER_EXT_TAIL_BITS = 5U;
+    static constexpr uint32_t HELPER_EXT_TAIL_MASK = (1U << HELPER_EXT_TAIL_BITS) - 1U;
+    uint32_t helperExtPack_ = 0U;
+    // ⚠ 这里曾经放过两个成员（fdAttenOutOffset / fdActMBaseSize），存归约要用的
+    //    输出位置和行数。12 字节，FD=0 时也照样占着类的空间 —— 实测 bs=16
+    //    全命中端退化 4.4%（+4.7 μs），而那两个值 FD=0 时一次都没被写过。
+    //    现在改成从 tensorACoreOffset 和 tempLoopInfo 现算，一个成员都不留。
+    //    同类教训见优化 05：两个 int64_t[32] 挂成成员，退化 32.7%。
 
     __gm__ uint8_t *keyPtr = nullptr;
     __gm__ uint8_t *valuePtr = nullptr;
@@ -176,7 +197,7 @@ private:
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths);
     __aicore__ inline void InitOutputSingleCore();
     // ================================Process functions================================
-    __aicore__ inline void ProcessBalance();
+    __aicore__ inline void ProcessBalance(uint32_t bN2Stride);
     __aicore__ inline void PreloadPipeline(uint32_t loop, uint64_t s2Start, uint64_t s2LoopIdx,
                                            RunInfo extraInfo[FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE], uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock);
     // ================================Offset Calc=====================================
@@ -190,6 +211,7 @@ private:
     __aicore__ inline uint64_t GetBalanceActualSeqLengths(GlobalTensor<int32_t> &actualSeqLengths, uint32_t bIdx);
     __aicore__ inline uint32_t GetActualSeqLenKV(uint32_t bIdx);
     __aicore__ inline void GetBN2Idx(uint32_t bN2Idx, uint32_t &bIdx, uint32_t &n2Idx);
+    __aicore__ inline void UpdateInner(uint32_t &s2End, uint32_t &curS2End, uint32_t s1Idx, bool isEnd);
     __aicore__ inline void GetPreNextTokensLeftUp();
     // ================================Mm1==============================================
     __aicore__ inline void ComputeMm1(const RunInfo &info);
@@ -198,6 +220,7 @@ private:
     __aicore__ inline void Bmm2DataCopyOut(uint64_t attenOutOffset, LocalTensor<OUT_T> &attenOutUb, uint32_t startRow,
                                            uint32_t dealRowCount, uint32_t columnCount, uint32_t actualColumnCount);
     __aicore__ inline void InitAllZeroOutput(uint32_t bIdx, uint32_t s1Idx, uint32_t n2Idx);
+    __aicore__ inline void ReduceSplitKVOut();
 };
 
 template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::InitTilingData()
@@ -268,13 +291,13 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
         uint32_t tBase = bIdx == 0 ? 0 : actualSeqLengthsQGm.GetValue(bIdx - 1);
         uint32_t s1Count = tempLoopInfo.actS1Size;
 
-        uint64_t attenOutOffset = (tBase + s1Idx) * kvHeadNum * constInfo.gSize * headDim +   // T- and S1-axis offset
-                                    n2Idx * constInfo.gSize * headDim;                        // N2-axis offset
+        uint64_t attenOutOffset = (tBase + s1Idx) * kvHeadNum * constInfo.gSize * headDim +   // T轴、s1轴偏�?
+                                    n2Idx * constInfo.gSize * headDim;                        // N2轴偏�?
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * headDim, 0);
     } else if (constInfo.outputLayout == FusedSparseAttentionOverlapLayout::BSND) {
         uint64_t attenOutOffset = bIdx * constInfo.qSeqSize * kvHeadNum * constInfo.gSize * headDim +
-                                    s1Idx * kvHeadNum * constInfo.gSize * headDim +           // B- and S1-axis offset
-                                    n2Idx * constInfo.gSize * headDim;                        // N2-axis offset
+                                    s1Idx * kvHeadNum * constInfo.gSize * headDim +           // B轴、S1轴偏�?
+                                    n2Idx * constInfo.gSize * headDim;                        // N2轴偏�?
         matmul::InitOutput<OUT_T>(attentionOutGm[attenOutOffset], constInfo.gSize * headDim, 0);
     }
 }
@@ -306,7 +329,7 @@ template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::GetSparseActualSeqLen(uint32_t bIdx, uint32_t s1Idx,
                                                                             uint32_t n2Idx)
 {
-    if (tempLoopInfo.nextTokensPerBatch < 0 && s1Idx < (-tempLoopInfo.nextTokensPerBatch)) { // An invalid row exists
+    if (tempLoopInfo.nextTokensPerBatch < 0 && s1Idx < (-tempLoopInfo.nextTokensPerBatch)) { //存在行无�?
         tempLoopInfo.curActualSeqLen = 0;
         return;
     }
@@ -373,6 +396,18 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
+__aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::UpdateInner(uint32_t &s2End, uint32_t &curS2End,
+                                                                                  uint32_t s1Idx, bool isEnd)
+{ 
+    uint32_t s1BaseSize = 1;
+    int64_t s1Offset = s1BaseSize * s1Idx;
+    int64_t s2LastToken = Min(s1Offset + tempLoopInfo.nextTokensPerBatch + s1BaseSize,tempLoopInfo.curActualSeqLenOri);
+    s2LastToken = Min(constInfo.sparseBlockSize * constInfo.sparseBlockCount, s2LastToken);
+    curS2End = (s2LastToken + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
+    tempLoopInfo.s2LoopTimes = isEnd ? constInfo.s2End + 1 : curS2End;
+}
+
+template <typename FusedSparseAttentionOverlapTraits>
 __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::InitSelectionUpdateGlobalTensor(
     __gm__ uint8_t *selectionKRope, __gm__ uint8_t *selectionKvCache,
     __gm__ uint8_t *selectionKvBlockTable, __gm__ uint8_t *selectionKvBlockStatus,
@@ -436,7 +471,7 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
     InitTilingData();
     InitActualSeqLen(actualSeqLengthsQ, actualSeqLengths);
 
-    // Initialize computation parameters.
+    // 初始化计算参�?
     InitCalcParamsEach();
     pipe = tPipe;
     keyPtr = key;
@@ -462,8 +497,8 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
     }
     topKGm.SetGlobalBuffer((__gm__ int32_t *)sparseIndices);
 
-    // Workspace memory layout
-    // |Q--|mm1ResGm(stores S)|vec1ResGm(stores A1,A2)|mm2ResGm(stores O)|vec2ResGm
+    // workspace 内存排布
+    // |Q--|mm1ResGm(存S)|vec1ResGm(存A1,A2)|mm2ResGm(存O)|vec2ResGm
     // |Core0_Q1-Core0_Q2-Core1_Q1-Core1_Q2....Core32_Q1-Core32_Q2|Core0_mmRes
     uint64_t offset = 0;
     mm1ResGm.SetGlobalBuffer(
@@ -488,6 +523,11 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
 
         kvValidSizeGm_.SetGlobalBuffer(
             (__gm__ int32_t *)(workspace + offset + (aiCoreIdx * 2) * 128 * 4 * sizeof(int32_t)));
+        // ⚠ 这一行原来没有。它上面每一个 SetGlobalBuffer 之后都推进了 offset，
+        // 只有 kvValidSizeGm_ 没推 —— FLASH_DECODE=1 时下面的 accumOutGm 就
+        // 直接盖在它身上，两块缓冲完全重叠。FD=1 从没编译过，所以没人发现。
+        // ⚠ FD=0 时 offset 在这之后没人再用，这一行对现有路径无影响。
+        offset += GetBlockNum() * 2 * 128 * 4 * sizeof(int32_t);
     }
 
     if constexpr (FLASH_DECODE) {
@@ -503,6 +543,48 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
         vectorService.InitMm2ResInt32GmGlobalTensor(mm2ResInt32Gm);
         if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
             vectorService.InitVec0GlobalTensor(kvValidSizeGm_, kvMergeGm_, kRopeGm, keyGm, blockTableGm);
+            if (numHelpers_ > 0) {
+                // 握手中转区借用槽：legacy 借第一个空闲核（slot[usedCoreNum]，自身 merge 槽闲置）；
+                // extend 借第一个尾波 helper（slot[r]，r=尾波任务数）——tail 期间它只写 target
+                // 的槽、自身槽闲置（满波写脏由尾波前重新清零闭合，见 Process）。ring 按 pair
+                // 隔离：done/credit 各 numHelpers_ 个 ring（extend 时 numHelpers_=r；每 ring
+                // 64 槽×32B），消除共享 ring 的跨 pair 误信用隐患。
+                constexpr uint32_t syncRing =
+                    FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::HELPER_SYNC_RING;
+                constexpr uint32_t syncSlot =
+                    FusedSparseAttentionOverlapVectorService<FusedSparseAttentionOverlapTraits>::HELPER_SYNC_SLOT_INT32;
+                const uint64_t perCoreMergeBytes = 512ULL * 576 * 4 * sizeof(KV_T);
+                __gm__ uint8_t *kvMergeArena = workspace +
+                    GetBlockNum() * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(MM1_OUT_T) +
+                    GetBlockNum() * dbWorkspaceRatio * constInfo.mmResUbSize * sizeof(KV_T) +
+                    GetBlockNum() * dbWorkspaceRatio * constInfo.bmm2ResUbSize * sizeof(MM2_OUT_T);
+                uint32_t helperBaseCore =
+                    (helperExtPack_ != 0U) ? (helperExtPack_ & HELPER_EXT_TAIL_MASK) : usedCoreNum;
+                __gm__ int32_t *syncBase = (__gm__ int32_t *)(kvMergeArena +
+                    (uint64_t)helperBaseCore * perCoreMergeBytes);
+                GlobalTensor<int32_t> mergeDoneGm;
+                GlobalTensor<int32_t> mergeCreditGm;
+                mergeDoneGm.SetGlobalBuffer(syncBase);
+                mergeCreditGm.SetGlobalBuffer(syncBase +
+                    (uint64_t)numHelpers_ * syncRing * syncSlot);
+                vectorService.InitHelperSync(mergeDoneGm, mergeCreditGm, numHelpers_);
+                if (isHelperAiCore_) {
+                    // helper 直接写 target 核的 merge 缓冲
+                    GlobalTensor<KV_T> targetKvMergeGm;
+                    targetKvMergeGm.SetGlobalBuffer((__gm__ KV_T *)(kvMergeArena +
+                        (uint64_t)helperTargetAiCoreIdx_ * perCoreMergeBytes));
+                    vectorService.InitHelperV0(targetKvMergeGm, helperTargetAiCoreIdx_);
+                } else if (helperPartCount_ > 1) {
+                    // target：helper 核号 = helperBaseCore + 本核号（一对一），
+                    // 回收它的部分有效计数要读它的 kvValidSizeGm_（紧跟 kvMerge 区之后）。
+                    GlobalTensor<int32_t> helperValidSizeGm;
+                    helperValidSizeGm.SetGlobalBuffer((__gm__ int32_t *)(kvMergeArena +
+                        GetBlockNum() * perCoreMergeBytes +
+                        (uint64_t)(helperBaseCore + aiCoreIdx) * 2 * 128 * 4 * sizeof(int32_t)));
+                    vectorService.SetHelperParts(helperPartIdx_, helperPartCount_, helperValidSizeGm,
+                                                 aiCoreIdx);
+                }
+            }
         }
         vectorService.InitVec1GlobalTensor(mm1ResGm, vec1ResGm, actualSeqLengthsQGm,
                                            actualSeqLengthsKVGm, lseMaxFdGm, lseSumFdGm, topKGm);
@@ -516,15 +598,21 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
         matmulService.InitPageAttentionInfo(kvMergeGm_, blockTableGm, topKGm,
                                             constInfo.kvCacheBlockSize, constInfo.maxBlockNumPerBatch);
     }
-    // Must run after InitParams.
+    // 要在InitParams之后执行
     if (pipe != nullptr) {
         InitBuffers();
     }
+    // 全核屏障（功能代码，非 timer）：原属 timer 初始化块，timerAddr 恒非空时每次 launch 都执行。
+    // helper 握手区（mergeDone/mergeCredit GM 槽）跨 launch 的干净状态依赖它——SignalMergeDone
+    // 的原子加发出后不等落地核即继续，缺少本屏障时上一 launch 慢核的在飞写与本 launch
+    // ZeroHelperSyncArea 的清零失去串行化，done 槽残留计数会让 WaitMergeDone 提前满足，
+    // target 在 helper 搬完前读 kvMerge，输出错乱（剥离 timer 后精度 bs=2/4/8 挂的根因）。
+    AscendC::SyncAll<false>();
 }
 
 template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::InitCalcParamsEach()
 {
-    // Calculate the total number of base blocks.
+    //计算总的基本�?
     uint32_t totalBaseNum = 0;
 	uint32_t s1GBaseSize = constInfo.gSize;
 	uint32_t actBatchS2 = 1;
@@ -538,22 +626,98 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
         }
         totalBaseNum += actBatchS1*actBatchS2 ;
     }
+    // helper-extend：bs>24 且尾波能开 1:1 helper（r∈[1,12]）才走波次路径；
+    // r=0/r>12 与 bs≤24 走下方原逻辑（无 helper 收益的窗口波次拆分只有排空成本）。
+    // 不与 splitKV 叠加：FD=1 变体永不进本分支（本分支只对 V_TEMPLATE 非 FD 生效）。
+    // 波次直接映射（任务号=bN2Idx 步进）要求每 batch 恰好 1 个任务单元：
+    // totalBaseNum != batchSize*kvHeadNum（存在多 gS1 块 batch / 零长度 batch）时
+    // 回退下方 legacy 平均派 —— 多 token 场景正确性守卫。
+    // ⚠ HELPER_EXT_ENABLE=false 时整块不进编译 —— 集中测试只要 bs≤12 的 1:1 helper，
+    //   波次版代码完整保留在源里，恢复 = 翻上方总开关。
+    if constexpr (HELPER_EXT_ENABLE && TEMPLATE_MODE == V_TEMPLATE && !FLASH_DECODE) {
+        uint32_t tailNum = totalBaseNum % coreNum;
+        if (totalBaseNum > coreNum && tailNum >= 1 && tailNum * 2 <= coreNum &&
+            totalBaseNum <= coreNum * HELPER_EXT_MAX_WAVES &&
+            totalBaseNum == constInfo.batchSize * kvHeadNum) { // 单任务守卫：非 decode 形态回退
+            helperExtPack_ = ((totalBaseNum / coreNum) << HELPER_EXT_TAIL_BITS) | tailNum;
+            numHelpers_ = tailNum;
+            // 尾波 helper 角色在 Init 区预设（Process 满波段由 SetWaveHelperRole 覆盖）
+            if (aiCoreIdx >= tailNum && aiCoreIdx < tailNum * 2) {
+                isHelperAiCore_ = true;
+                helperTargetAiCoreIdx_ = aiCoreIdx - tailNum;
+                helperPartIdx_ = 1;
+                helperPartCount_ = 2;
+            } else if (aiCoreIdx < tailNum) {
+                helperPartIdx_ = 0;
+                helperPartCount_ = 2;
+            }
+            return;
+        }
+    }
     uint32_t avgBaseNum = 1;
+    uint32_t kvSplitNum = 1;
     if (totalBaseNum > coreNum) {
         avgBaseNum = (totalBaseNum + coreNum - 1) / coreNum;
     }else {
         usedCoreNum = totalBaseNum;
+        // splitKV：核没用满时，把每个任务的 KV 再切成 kvSplitNum 段交给空转的核，
+        // 各算一份局部结果，Process() 末尾再归约成一份。
+        if constexpr (FLASH_DECODE) {
+            uint32_t roomPerTask = (totalBaseNum > 0) ? (coreNum / totalBaseNum) : 1;
+            kvSplitNum = constInfo.splitKVNum;   // host 给的上限
+            if (kvSplitNum > roomPerTask) {
+                kvSplitNum = roomPerTask;
+            }
+            if (kvSplitNum < 1) {
+                kvSplitNum = 1;
+            }
+            usedCoreNum = totalBaseNum * kvSplitNum;
+        }
+    }
+    // ⚠ 要在下面那个 return 之前写回：不干活的核也得知道切了几段，归约要用
+    constInfo.splitKVNum = kvSplitNum;
+    // helper：只在一对一覆盖全部活跃核时才启用 —— kernel 时间由最慢核决定，
+    // 半覆盖时没 helper 的核是瓶颈，配上 helper 的核白付握手费（实测 bs=4/16
+    // 劣化 2~8%）。bs=1/2 满足全覆盖（4+20 / 8+16），bs=4/16 回落原路径。
+    if (usedCoreNum < coreNum && coreNum - usedCoreNum >= usedCoreNum) {
+        numHelpers_ = usedCoreNum;
     }
     if(aiCoreIdx>=usedCoreNum){
-        return;
+        // helper：前 numHelpers_ 个空闲核各帮一个活跃核
+        if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+            uint32_t helperIdx = aiCoreIdx - usedCoreNum;
+            if (helperIdx >= numHelpers_) {
+                return; // 多余的空闲核，照旧空转
+            }
+            isHelperAiCore_ = true;
+            helperTargetAiCoreIdx_ = helperIdx; // 与 target 一一对应
+            currCoreIdx = helperTargetAiCoreIdx_ / kvSplitNum; // 与 target 同一个任务
+            helperPartIdx_ = 1;
+            helperPartCount_ = 2;
+        } else {
+            return;
+        }
+    } else {
+        // 本核负责第几个任务
+        currCoreIdx = aiCoreIdx / kvSplitNum;
+        // 前 numHelpers_ 个活跃核各配了一个 helper
+        if (aiCoreIdx < numHelpers_) {
+            helperPartIdx_ = 0;
+            helperPartCount_ = 2;
+        }
     }
-	// Calculate the base blocks assigned to the current core.
-	uint32_t accumBaseNum = 0;                       // Number of base blocks accumulated so far
+    // 局部结果存 workspace 的第几格。总格号 = 任务号 * 段数 + 段号，而
+    // 任务号 = aiCoreIdx / k、段号 = aiCoreIdx % k，两下相乘再相加恰好还原成
+    // aiCoreIdx —— 于是每个核写自己那一格，天然不撞车，CalcAccumOffset 保持 0。
+    // 归约时任务 t 的 k 份就躺在核号 [t*k, t*k+k) 这段连续格子里。
+    constInfo.coreStartKVSplitPos = aiCoreIdx;
+	//计算当前核的基本�?
+	uint32_t accumBaseNum = 0;                       // 当前累积的基本块�?
     uint32_t targetBaseNum = 0;
     uint32_t lastValidBIdx = 0;
     uint32_t lastValidactBatchS1=0;
     bool setStart=false;
-	targetBaseNum = (currCoreIdx + 1) * avgBaseNum;  // Calculate the target workload for the current core
+	targetBaseNum = (currCoreIdx + 1) * avgBaseNum;  // 计算当前的目标权�?
     uint32_t targetStartBaseNum = targetBaseNum-avgBaseNum;
     for (uint32_t bN2Idx = 0; bN2Idx < constInfo.batchSize * constInfo.kvHeadNum; bN2Idx++) { 
         uint32_t bIdx = bN2Idx / constInfo.kvHeadNum;
@@ -566,12 +730,14 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
                 setStart=true;
             }
             if (accumBaseNum >= targetBaseNum) {
-                // Update the end position in the current core partition.
+                // 更新当前核的End分核信息
                 constInfo.bN2End = bN2Idx;
                 constInfo.gS1End = s1GIdx;
                 constInfo.s2End = 0;
-                constInfo.coreStartKVSplitPos = 0;
-                if (aiCoreIdx != 0) {
+                // ⚠ 切了段就不能清零 —— 这个值是本核的 workspace 格号，归约靠它定位
+                constInfo.coreStartKVSplitPos = (kvSplitNum > 1) ? aiCoreIdx : 0;
+                // ⚠ 判据是任务号不是核号：同一个任务的 k 个核必须拿到相同的起点
+                if (currCoreIdx != 0) {
                     GetAxisStartIdx(constInfo.bN2Start, constInfo.gS1Start, 0);
                 }
                 return;
@@ -587,12 +753,12 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
         constInfo.gS1Start = lastValidactBatchS1-1;
     }
     if (accumBaseNum < targetBaseNum) {
-		// Update the end position in the final core partition.
+		// 更新最后一个核的End分核信息
 		constInfo.bN2End = lastValidBIdx;
         constInfo.gS1End = lastValidactBatchS1-1;
         constInfo.s2End = 0;
-        constInfo.coreStartKVSplitPos = 0;
-        if (aiCoreIdx != 0) {
+        constInfo.coreStartKVSplitPos = (kvSplitNum > 1) ? aiCoreIdx : 0;
+        if (currCoreIdx != 0) {
             GetAxisStartIdx(constInfo.bN2Start, constInfo.gS1Start, 0);
         }
         return;
@@ -709,11 +875,12 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
     info.tensorBRopeOffset = tensorBRopeCoreOffset;
     info.attenOutOffset = tensorACoreOffset;
 
+
     uint64_t sInnerOffsetDataSize = info.s2Idx * constInfo.s2BaseSize;
     info.s2BatchOffset = s2BatchBaseOffset + sInnerOffsetDataSize;
 
     info.curActualSeqLenOri = tempLoopInfo.curActualSeqLenOri;
-    // Calculate the actual base-block size.
+    //计算实际基本块size
     if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
         if (tempLoopInfo.curActualSeqLen > sInnerOffsetDataSize) {
             info.actualSingleProcessSInnerSize = tempLoopInfo.curActualSeqLen - sInnerOffsetDataSize;
@@ -764,24 +931,155 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
 {
     if ASCEND_IS_AIV {
         vectorService.RunAllCoreSelectionUpdate();
+        if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+            if (numHelpers_ > 0 && aiCoreIdx == 0 && GetSubBlockIdx() == 0) {
+                // 清零 helper 握手区：走 MTE3，SyncAll 保证全核可见（标量写不可靠）
+                vectorService.ZeroHelperSyncArea();
+            }
+        }
     }
     SyncAll<false>();
 
-    if (aiCoreIdx < usedCoreNum) {
-        if ASCEND_IS_AIV {
+    // helper-extend：legacy 与波次调度收进同一个循环，ProcessBalance 全程序只保留
+    // 下面 2 个静态调用点（target/helper，与 noext-base 相同）。此前 ProcessWave
+    // 另有 3 个调用点，inline 展开后 .o 从 577KB 涨到 2610KB，全 bs 劣化 6~16%。
+    // legacy：单段、角色在 InitCalcParamsEach 已定；extend：满波段 + 尾波段共 2 段。
+    // 满波段一次 ProcessBalance 步进跑完 k 个任务（流水线常开，同 legacy 平均派），
+    // 只有尾波段（角色切换）单独再调一次——流水线重启从 k+1 次降到 2 次。
+    // 事件开阖 + softmax 模板每 launch 一次（此前每段一次）：每段 ProcessBalance
+    // 结束时缓冲旗标回到 +1 平衡态（否则 FreeEventID 的 WaitFlag 会挂死），softmax
+    // 模板段内只读（legacy 平均派多任务单调用即如此），段间无需重复开阖。
+    uint32_t totalWaves = 1;
+    uint32_t waveFull = helperExtPack_ >> HELPER_EXT_TAIL_BITS;  // 满波任务数 k（pack=0 时为 0）
+    uint32_t tailNum = helperExtPack_ & HELPER_EXT_TAIL_MASK;    // 尾波任务数 r（pack=0 时为 0）
+    // 本核的并集角色（决定开/合闸是否执行）：extend 满波段全核 target；
+    // legacy target 双开，helper 仅 AIV，无任务核不开不合。
+    bool aivRuns;
+    bool aicRuns;
+    if (helperExtPack_ != 0U) {
+        totalWaves = 2; // extend：段 0=满波段，段 1=尾波段（Init 守卫保证 waveFull>=1）
+        aivRuns = true;
+        aicRuns = true;
+    } else {
+        aivRuns = (aiCoreIdx < usedCoreNum) || isHelperAiCore_;
+        aicRuns = (aiCoreIdx < usedCoreNum);
+    }
+    if ASCEND_IS_AIV {
+        if (aivRuns) {
             vectorService.AllocEventID();
             vectorService.InitSoftmaxDefaultBuffer();
-        } else {
+        }
+    } else {
+        if (aicRuns) {
             matmulService.AllocEventID();
         }
-        ProcessBalance();
+    }
+    for (uint32_t wave = 0; wave < totalWaves; wave++) {
+        uint32_t bN2Stride = 1;
+        if (helperExtPack_ != 0U) {
+            if (wave == 0 && waveFull > 0) {
+                // 满波段：全 target、无 helper（partCount=1 → 原行为）。
+                // 任务 {j, 24+j, ..., j+(k-1)*24} 步进映射，一次 ProcessBalance 跑完。
+                helperPartCount_ = 1;
+                isHelperAiCore_ = false;
+                vectorService.SetWaveHelperRole(false, 0, 0, 1, kvMergeGm_);
+                constInfo.bN2Start = aiCoreIdx;
+                constInfo.bN2End = aiCoreIdx + (waveFull - 1) * usedCoreNum;
+                bN2Stride = usedCoreNum;
+            } else {
+                // 尾波段：pack!=0 ⇒ r∈[1,12] ⇒ 恒开 1:1 helper。握手区满波被写脏，
+                // 尾波前重新清零（MTE3 拷贝 + 双 SyncAll 保证落地与全核可见，全核必达）。
+                SyncAll<false>();
+                if ASCEND_IS_AIV {
+                    if (aiCoreIdx == 0 && GetSubBlockIdx() == 0) {
+                        vectorService.ZeroHelperSyncArea();
+                    }
+                }
+                SyncAll<false>();
+                bool isTailTarget = (aiCoreIdx < tailNum);
+                bool isTailHelper = (aiCoreIdx >= tailNum) && (aiCoreIdx < tailNum * 2);
+                if (!isTailTarget && !isTailHelper) {
+                    continue; // 尾波段空过的核（上面的 SyncAll 仍然全核走到）
+                }
+                uint32_t tailTask = waveFull * usedCoreNum +
+                    (isTailTarget ? aiCoreIdx : aiCoreIdx - tailNum);
+                helperPartCount_ = 2;
+                isHelperAiCore_ = isTailHelper;
+                if (isTailHelper) {
+                    helperTargetAiCoreIdx_ = aiCoreIdx - tailNum;
+                    // 尾波 helper 直写 target 核的 merge 槽：由本核槽地址按槽距现算，
+                    // 不再挂成员（成员占位实测劣化）。kvMerge 槽按核等距排布。
+                    GlobalTensor<KV_T> targetKvMergeGm;
+                    targetKvMergeGm.SetGlobalBuffer((__gm__ KV_T *)(
+                        (__gm__ uint8_t *)kvMergeGm_.GetPhyAddr(0) +
+                        ((int64_t)helperTargetAiCoreIdx_ - (int64_t)aiCoreIdx) *
+                            (int64_t)(512ULL * 576 * 4 * sizeof(KV_T))));
+                    vectorService.SetWaveHelperRole(true, helperTargetAiCoreIdx_, 1, 2,
+                                                    targetKvMergeGm);
+                } else {
+                    vectorService.SetWaveHelperRole(false, aiCoreIdx, 0, 2, kvMergeGm_);
+                }
+                constInfo.bN2Start = tailTask;
+                constInfo.bN2End = tailTask;
+            }
+            constInfo.gS1Start = 0;
+            constInfo.gS1End = 0;
+            constInfo.s2Start = 0;
+            constInfo.s2End = 0;
+            constInfo.coreStartKVSplitPos = 0;
+        } else if (aiCoreIdx >= usedCoreNum && !isHelperAiCore_) {
+            continue; // legacy：无任务核空过（等价于原 if/else if 双双落空）
+        }
 
-        if ASCEND_IS_AIV {
-            vectorService.FreeEventID();
+        if (!isHelperAiCore_) {
+            ProcessBalance(bN2Stride);
         } else {
+            // helper：只做 MergeKv 搬运，不进完整流水（helper 的 AIC 直接等核内流水外）
+            if ASCEND_IS_AIV {
+                ProcessBalance(bN2Stride);
+            }
+        }
+    }
+    if ASCEND_IS_AIV {
+        if (aivRuns) {
+            vectorService.FreeEventID();
+        }
+    } else {
+        if (aicRuns) {
             matmulService.FreeEventID();
         }
     }
+
+    // splitKV：各段都算完了，把同一个请求的几份并成一份写出去。
+    // ⚠ SyncAll 必须每个核都走到，所以放在上面那个闸门之外 —— 位置照抄本函数
+    //    开头 RunAllCoreSelectionUpdate 之后那一处，那里本来就是这么放的。
+    //    splitKVNum 全核一致，这个 if 要么全进要么全不进，不会有人卡在同步点上。
+    if constexpr (FLASH_DECODE) {
+        if (constInfo.splitKVNum > 1) {
+            SyncAll<false>();
+            if ASCEND_IS_AIV {
+                ReduceSplitKVOut();
+            }
+        }
+    }
+}
+
+template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::ReduceSplitKVOut()
+{
+    uint32_t part = constInfo.splitKVNum;
+    // 每一组段里的头一个核负责归约 —— 它手上正好有这个请求的输出位置和行数，
+    // 而它那一组的 part 份局部结果就躺在核号 [aiCoreIdx, aiCoreIdx + part) 这几格里。
+    if (aiCoreIdx >= usedCoreNum || (aiCoreIdx % part) != 0) {
+        return;
+    }
+    // 行数按 CalcParams 里的同一套公式现算；输出位置直接用 tensorACoreOffset
+    // ——它在本核最后一个任务的首个 S2 循环里已经填好，ProcessBalance 结束后还留着。
+    uint32_t mCount = constInfo.mBaseSize;
+    uint32_t remainedGS1Size = tempLoopInfo.actS1Size * constInfo.gSize - tempLoopInfo.gS1Idx;
+    if (remainedGS1Size <= constInfo.mBaseSize && remainedGS1Size > 0) {
+        mCount = tempLoopInfo.mBasicSizeTail;
+    }
+    vectorService.ReduceSplitKV(aiCoreIdx, part, mCount, tensorACoreOffset);
 }
 
 template <typename FusedSparseAttentionOverlapTraits>
@@ -792,9 +1090,14 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
     n2Idx = bN2Idx % kvHeadNum;
 }
 
-template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::ProcessBalance()
+template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::ProcessBalance(uint32_t bN2Stride)
 {
     RunInfo extraInfo[FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE];
+    // CCE 不保证栈上数组默认成员初始化（isValid=false）生效，显式初始化：
+    // loop 0/1 会读 loop+1/+2 槽的 isValid，脏值会导致用脏 RunInfo 做 Vec1/Vec2
+    for (uint32_t i = 0; i < FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE; i++) {
+        extraInfo[i].isValid = false;
+    }
     uint32_t gloop = 0;
     int gS1LoopEnd;
     bool globalLoopStart = true;
@@ -807,9 +1110,11 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
             CrossCoreSetFlag<ConstInfo::FUSED_SPARSE_ATTENTION_OVERLAP_SYNC_MODE2, PIPE_MTE2>(3);
         }
     }
-    for (uint32_t bN2LoopIdx = constInfo.bN2Start; bN2LoopIdx <= constInfo.bN2End; bN2LoopIdx++) {
+    // bN2Stride：bN2 任务步进。legacy/尾波段=1（连续）；extend 满波段=coreNum（任务 j,24+j,…）。
+    // stride=1 时与原有逐个连续迭代完全等价；段内多任务共用一条流水线（同 legacy 平均派）。
+    for (uint32_t bN2LoopIdx = constInfo.bN2Start; bN2LoopIdx <= constInfo.bN2End; bN2LoopIdx += bN2Stride) {
         GetBN2Idx(bN2LoopIdx, tempLoopInfo.bIdx, tempLoopInfo.n2Idx);
-        GetActualSeqLen(tempLoopInfo.bIdx); // Obtain actualSeqLength and actualSeqLengthKV
+        GetActualSeqLen(tempLoopInfo.bIdx); // 获取actualSeqLength及ActualSeqLengthKV
         GetPreNextTokensLeftUp();
         if (tempLoopInfo.actS1Size == 0) {
             continue;
@@ -818,27 +1123,53 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
         gS1LoopEnd = (bN2LoopIdx == constInfo.bN2End) ? constInfo.gS1End : gS1SplitNum - 1;
         for (uint32_t gS1LoopIdx = constInfo.gS1Start; gS1LoopIdx <= gS1LoopEnd; gS1LoopIdx++) {
             tempLoopInfo.gS1Idx = gS1LoopIdx * constInfo.mBaseSize;
-            GetSparseActualSeqLen(tempLoopInfo.bIdx, gS1LoopIdx, tempLoopInfo.n2Idx); // actualSeqLengthKV after TopK sparsification
+            GetSparseActualSeqLen(tempLoopInfo.bIdx, gS1LoopIdx, tempLoopInfo.n2Idx); // TopK值sparse完后的ActualSeqLengthKV
             UpdateInnerLoopCond();
 
-            if (tempLoopInfo.curActSeqLenIsZero) {
+            // helper 不写零输出（target 会写），只保证迭代序列一致
+            if (tempLoopInfo.curActSeqLenIsZero && !isHelperAiCore_) {
                 DealActSeqLenIsZero(tempLoopInfo.bIdx, gS1LoopIdx, tempLoopInfo.n2Idx);
             }
             int s2SplitNum =
-                (tempLoopInfo.curActualSeqLen + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize; // Number of S2 partitions
+                (tempLoopInfo.curActualSeqLen + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize; // S2切分份数
             bool isEnd = (bN2LoopIdx == constInfo.bN2End) && (gS1LoopIdx == constInfo.gS1End);
             tempLoopInfo.s2LoopTimes = s2SplitNum;
-            // Enable after updating core partitioning.
-            // Whether the current S2 is partitioned determines whether the output is written to attenOut.
+            // splitKV：把 [0, s2SplitNum) 这些块按段分给本任务的 k 个核。
+            // ⚠ 下面那个 tndIsS2SplitCore 的表达式本来就是对的 —— 只要起点非 0
+            //    或者终点不是全部，它自己就变 true。上游注释说"分核修改后需要打开"，
+            //    其实要改的只是分核，判据一个字不用动。
+            if constexpr (FLASH_DECODE) {
+                if (constInfo.splitKVNum > 1) {
+                    uint32_t part = constInfo.splitKVNum;
+                    uint32_t perPart = ((uint32_t)s2SplitNum + part - 1) / part;
+                    // ⚠ 这里要的是段号（0..k-1），不是 coreStartKVSplitPos 那个格号。
+                    //    格号 = 任务号 * k + 段号，两者差着一个任务号，别混用。
+                    uint32_t begin = (aiCoreIdx % part) * perPart;
+                    uint32_t end = begin + perPart;
+                    if (begin >= (uint32_t)s2SplitNum) {
+                        // 段比块还多，本核一块都分不到。让它当"这一块没数据"跑一轮：
+                        // lse 填中性值、accumOut 填零，否则归约端读到的是脏数据。
+                        begin = (uint32_t)s2SplitNum;
+                        end = begin + 1;
+                    } else if (end > (uint32_t)s2SplitNum) {
+                        end = (uint32_t)s2SplitNum;
+                    }
+                    constInfo.s2Start = begin;
+                    tempLoopInfo.s2LoopTimes = end;
+                }
+            }
+            // 分核修改后需要打开
+            // 当前s2是否被切，决定了输出是否要写到attenOut�?
             tempLoopInfo.tndIsS2SplitCore =
                 ((constInfo.s2Start == 0) && (tempLoopInfo.s2LoopTimes == s2SplitNum)) ? false : true;
-            tempLoopInfo.tndCoreStartKVSplitPos = globalLoopStart ? constInfo.coreStartKVSplitPos : 0;
+            tempLoopInfo.tndCoreStartKVSplitPos =
+                (globalLoopStart || constInfo.splitKVNum > 1) ? constInfo.coreStartKVSplitPos : 0;
             uint32_t extraLoop = isEnd ? 2 : 0;
 
             uint32_t curTopKIdx = 0;
             uint64_t curOffsetInSparseBlock = 0;
             for (int s2LoopIdx = constInfo.s2Start; s2LoopIdx < (tempLoopInfo.s2LoopTimes + extraLoop); s2LoopIdx++) {
-                // The initial PreloadPipeline loop value must be PRELOAD_NUM.
+                // PreloadPipeline loop初始值要求为 PRELOAD_NUM
                 PreloadPipeline(gloop, constInfo.s2Start, s2LoopIdx, extraInfo, curTopKIdx, curOffsetInSparseBlock);
                 ++gloop;
             }
@@ -848,12 +1179,15 @@ template <typename FusedSparseAttentionOverlapTraits> __aicore__ inline void Fus
         constInfo.gS1Start = 0;
     }
     if ASCEND_IS_AIV {
-        CrossCoreWaitFlag(constInfo.syncC2V1);
-        if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-            CrossCoreWaitFlag(3);
-            CrossCoreWaitFlag(3);
-            CrossCoreWaitFlag(3);
-            CrossCoreWaitFlag(3);
+        // helper 的 AIC 不设这些旗，一个都不等
+        if (!isHelperAiCore_) {
+            CrossCoreWaitFlag(constInfo.syncC2V1);
+            if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
+                CrossCoreWaitFlag(3);
+                CrossCoreWaitFlag(3);
+                CrossCoreWaitFlag(3);
+                CrossCoreWaitFlag(3);
+            }
         }
     }
 }
@@ -863,9 +1197,9 @@ __aicore__ inline void
 FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::PreloadPipeline(uint32_t loop, uint64_t s2Start, uint64_t s2LoopIdx,
                                                                RunInfo extraInfo[FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE], uint32_t &curTopKIdx, uint64_t &curOffsetInSparseBlock)
 {
-    RunInfo &extraInfo0 = extraInfo[loop % FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE];         // Current task
-    RunInfo &extraInfo2 = extraInfo[(loop + 2) % FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE]; // Previous task
-    RunInfo &extraInfo1 = extraInfo[(loop + 1) % FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE]; // Task before the previous one
+    RunInfo &extraInfo0 = extraInfo[loop % FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE];         // 本轮任务
+    RunInfo &extraInfo2 = extraInfo[(loop + 2) % FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE]; // 上一轮任�?
+    RunInfo &extraInfo1 = extraInfo[(loop + 1) % FUSED_SPARSE_ATTENTION_OVERLAP_PRELOAD_TASK_CACHE_SIZE]; // 上两轮任�?
 
     CalcParams(loop, s2Start, s2LoopIdx, extraInfo0);
     CalcSinnerTopKBegin(extraInfo0, curTopKIdx, curOffsetInSparseBlock);
@@ -878,18 +1212,44 @@ FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::PreloadPipeli
             ComputeMm1(extraInfo0);
         } else {
             if constexpr (TEMPLATE_MODE == V_TEMPLATE) {
-                CrossCoreWaitFlag(3);
-                vectorService.MergeKv(extraInfo0);
-                CrossCoreSetFlag<ConstInfo::FUSED_SPARSE_ATTENTION_OVERLAP_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV0C1);
-                if (vectorService.IsSelectionUpdateEnabled()) {
-                    vectorService.CopyOutSelectionUpdateFromKvMerge(extraInfo0);
+                if (isHelperAiCore_) {
+                    // helper V0/V1：等 target 发布槽位信用 → 各搬 1/4 → 计数 +1
+                    vectorService.WaitHelperCredit(extraInfo0.loop);
+                    vectorService.MergeKv(extraInfo0);
+                    vectorService.SignalMergeDone(extraInfo0.loop);
+                    // helper 分担回写：处理自己搬的那部分 token 的 update 槽位
+                    // （纯数据搬运，与 target 的 update 并行、不挡 done；状态标记
+                    // 由 target 统一做；对应 helper-only 仓 d06cb9f0）
+                    if (vectorService.IsSelectionUpdateEnabled()) {
+                        vectorService.CopyOutSelectionUpdateFromKvMerge(extraInfo0);
+                    }
+                } else {
+                    CrossCoreWaitFlag(3);
+                    if (helperPartCount_ > 1) {
+                        // 拿到 flag3 信用 = AIC 已读完这个槽，发布给 helper
+                        vectorService.PublishHelperCredit(extraInfo0.loop);
+                    }
+                    vectorService.MergeKv(extraInfo0);
+                    if (helperPartCount_ > 1) {
+                        // 等 helper 两半都落地，并把 helper 的有效计数并回自己的 kvValidSizeGm_。
+                        // ⚠ FixValidSize 必须在 setV0C1 之前：消费者在下一轮迭代的 Vec1L，
+                        // 覆盖顺序的 PIPE_MTE3 旗标只有 syncV0C1 这一个，挪后就没有序了。
+                        vectorService.WaitMergeDone(extraInfo0.loop);
+                        vectorService.FixValidSize(extraInfo0);
+                    }
+                    CrossCoreSetFlag<ConstInfo::FUSED_SPARSE_ATTENTION_OVERLAP_SYNC_MODE2, PIPE_MTE3>(constInfo.syncV0C1);
+                    if (vectorService.IsSelectionUpdateEnabled()) {
+                        vectorService.CopyOutSelectionUpdateFromKvMerge(extraInfo0);
+                    }
                 }
             }
         }
     }
     if (extraInfo2.isValid) {
         if ASCEND_IS_AIV {
-            vectorService.ProcessVec1L(extraInfo2);
+            if (!isHelperAiCore_) {
+                vectorService.ProcessVec1L(extraInfo2);
+            }
         }
         if ASCEND_IS_AIC {
             ComputeMm2(extraInfo2);
@@ -900,7 +1260,9 @@ FusedSparseAttentionOverlapMla<FusedSparseAttentionOverlapTraits>::PreloadPipeli
     }
     if (extraInfo1.isValid) {
         if ASCEND_IS_AIV {
-            vectorService.ProcessVec2L(extraInfo1);
+            if (!isHelperAiCore_) {
+                vectorService.ProcessVec2L(extraInfo1);
+            }
         }
         extraInfo1.isValid = false;
     }
@@ -942,7 +1304,7 @@ __aicore__ inline void FusedSparseAttentionOverlapMla<FusedSparseAttentionOverla
     constInfo.gS1Start = s1GEndPrev;
     
     constInfo.s2Start = 0;
-    if (s1GEndPrev >= s1GPrevBaseNum - 1) { // The previous core completed S1G
+    if (s1GEndPrev >= s1GPrevBaseNum - 1) { // 上个核把S1G处理完了
         constInfo.gS1Start = 0;
         constInfo.bN2Start++;
     } else {
