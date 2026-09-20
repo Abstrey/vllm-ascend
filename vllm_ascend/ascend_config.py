@@ -1040,6 +1040,11 @@ class SparseKVOffloadConfig:
         self.keep_device_kv_cache = bool(user_config.get("keep_device_kv_cache", False))
         self.use_fused_overlap = bool(user_config.get("use_fused_overlap", False))
 
+        # Per-worker LRU thread budget; retain the legacy default of 8.
+        self.lru_max_threads = user_config.get("lru_max_threads", 8)
+        if type(self.lru_max_threads) is not int or self.lru_max_threads <= 0:
+            raise ValueError("sparse_kv_offload_config.lru_max_threads must be a positive integer")
+
         if hasattr(vllm_config.model_config.hf_text_config, "compress_ratios"):
             raise ValueError("Sparse KV offload don't support compress now.")
         if not hasattr(vllm_config.model_config.hf_text_config, "index_topk"):
