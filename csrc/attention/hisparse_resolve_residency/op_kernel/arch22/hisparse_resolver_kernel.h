@@ -24,7 +24,7 @@ constexpr int32_t kHit = int32_t(0x80000000U);
 constexpr int32_t kMiss = 0x40000000;
 constexpr int32_t kSlotMask = 0xFFFF;
 constexpr int32_t kTile = 256;
-constexpr int32_t kMaxResidentColumns = 1024;
+constexpr int32_t kMaxResidentColumns = 2048;
 
 
 template <typename T>
@@ -182,6 +182,9 @@ public:
             state >= d.geometry[11] || cols <= 0 || cols > kMaxResidentColumns || cols != d.geometry[12] ||
             cols > hashSize || hot < 3072 || topk < kTile || topk > 2048 || topk % kTile ||
             d.geometry[10] != 128 || d.geometry[14] != 128 || d.geometry[16] != 128) return false;
+        // Each table in tags starts on a 32-byte DMA boundary.
+        const int32_t coldBase = (cols + 7) / 8 * 8;
+        if (coldBase + cols > hot) return false;
         GlobalTensor<int32_t> source, resident, logical;
         source.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(d.pointers[3]));
         resident.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(d.pointers[4]));
@@ -194,7 +197,7 @@ public:
                     DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
         Sync<HardEvent::MTE2_S>();
         bool hasCold = false;
-        auto coldPages = tags[kMaxResidentColumns].ReinterpretCast<float>();
+        auto coldPages = tags[coldBase].ReinterpretCast<float>();
         for (int32_t col = 0; col < cols; ++col) {
             int32_t hostPage = keys.GetValue(col), devicePage = values.GetValue(col);
             int64_t host = int64_t(hostPage) * 128;

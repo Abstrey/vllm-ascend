@@ -175,6 +175,9 @@ class AscendMLAAttention(MLAAttention):
         head_size, dtype, cache_dtype_str, use_sfa_turboquant, use_sfa_c8, use_sfa_hif8 = self._get_kv_cache_format(
             spec
         )
+        if model_type == "glm_moe_dsa" and use_sfa_c8:
+            # Packed MLA rows store the latent KV head, independent of query TP.
+            storage_heads = spec.num_kv_heads
         speculative_config = getattr(vllm_config, "speculative_config", None)
         draft_config = getattr(speculative_config, "draft_model_config", None)
         if (
