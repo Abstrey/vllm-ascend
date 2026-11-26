@@ -1,0 +1,8 @@
+pr: 23445
+entries:
+  - category: feature
+    text: >-
+      Add bounded device staging for GLM-5.3 packed INT8 KV reads on Ascend A3
+      and support wider resident page tables in the arch22 HiSparse resolver.
+    model: glm-5.3
+    hardware: [A3]
