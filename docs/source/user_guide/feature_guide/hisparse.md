@@ -38,12 +38,58 @@ across requests.
 | --- | --- |
 | Hardware and software | A2/A3 with the arch22 custom operators, or 950PR&950DT Products with a SIMT-capable CANN 9.2 toolchain. |
 | Cache formats | A2/A3: INT8 C8. 950PR&950DT Products: BF16 or native E4M3FN C8. C4 and TurboQuant are outside the current support scope. |
-| Parallelism and transport | Supports PCP (prefill and decode request sharding). DCP and external P/D transport are outside the current support scope. |
+| Parallelism and transport | Colocated serving supports PCP. The experimental [layerwise P/D receiver](#layerwise-kv-transfer-from-a-separate-prefill-node) supports equal TP, PCP1 and DCP1. |
 | Host storage | Use private Host pools per tensor-parallel rank and Core eager Host mirroring. |
 | TopK | The existing SFA requirement of divisibility by 128 applies. |
 | Feature mutual exclusion | HiSparse and `additional_config.sparse_kv_offload_config.enabled` cannot be enabled together. |
 
 ## Feature Usage
+
+### Layerwise KV transfer from a separate Prefill node
+
+On Ascend 950PR, the SFA producer can expose a completed attention layer to
+HiSparse Decode. Decode reads the Main KV from Prefill device memory into
+its Host source pages and reads the Indexer and its quantization scales into
+rank-local device pages. HiSparse uses its existing resident and hot caches
+when decoding. A shared-buffer Prefill slot can be reused after the local
+save and remote read complete.
+
+1. Follow the [layerwise Prefill and proxy setup](layerwise_and_sparse_kv_cache_offloading.md#2-layerwise-kv-cache-offload-on-prefill).
+   Set `"hisparse_target": true` in the Prefill **SfaRemoteD2HConnector**
+   child's `kv_connector_extra_config`. Keep its `AscendStoreConnector` child.
+2. Use the same model, KV and Indexer formats, logical page size and TP size
+   on both endpoints. This receiver requires PCP1 and DCP1. Prefill can use
+   PP and Decode can use DP with one pipeline stage per replica.
+3. On Decode use Model Runner V2, Core eager Host mirroring and the following
+   connector pair. The example reserves 8 GiB of Host KV per TP rank with
+   the current Ascend backend. Size this pool for the requested context and
+   concurrency. Leave legacy `sparse_kv_offload_config.enabled` disabled.
+
+```bash
+--attention-config '{"indexer_kv_dtype":"fp8","hisparse_config":{"eager_host_mirror":true}}' \
+--kv-transfer-config '{
+  "kv_connector": "MultiConnector",
+  "kv_role": "kv_consumer",
+  "kv_connector_extra_config": {"connectors": [
+    {"kv_connector": "HiSparseConnector", "kv_role": "kv_consumer",
+     "kv_connector_extra_config": {"host_pool_gib": 8, "transfer_backend": "memfabric"}},
+    {"kv_connector": "SfaRemoteD2HConnector", "kv_role": "kv_consumer",
+     "kv_port": 20050, "kv_connector_extra_config": {"hisparse_target": true}}
+  ]}
+}'
+```
+
+Set the MemFabric transport on the **SfaRemoteD2HConnector** child at each
+endpoint. For a fabric using host RDMA, set `memfabric_transfer_protocol` to
+`host_rdma`, `memfabric_host_rdma_ip` to the local RDMA interface IPv4 address,
+and `memfabric_host_rdma_port_base` to an unused integer TCP base port. The
+base advances by 16 per local device. Reserve the SDK's additional bootstrap
+port range and separate it from the connector control ports. The installed
+MemFabric SDK must provide `TransDataOpType.HOST_RDMA`.
+
+A private Host pool needs a complete Main copy on each rank. If the backend
+provides a TP-shared Host allocation, ranks divide the Main pages among
+themselves. Each rank receives the Indexer pages needed by its attention kernels.
 
 ### Usage Example
 
@@ -174,3 +220,35 @@ A request served from the local prefix cache may leave both counters unchanged.
 
 To fall back to local computation after an external load fails, set
 `kv_load_failure_policy=recompute` in `--kv-transfer-config`.
+
+### Layerwise GLM-5.3 INT8 KV transfer on Ascend A3
+
+For A3 deployments using Device RDMA and a rank-local Decode Host pool, enable
+`a3_stage_main_kv` on the `SfaRemoteD2HConnector` entry of both MultiConnectors.
+Use the same producer and consumer TP size. Keep DCP at one on both nodes and PCP at
+one on Decode. Prefill can use PCP with replicated KV and KV layer parallelism disabled.
+
+```json
+{
+  "use_layerwise": true,
+  "hisparse_target": true,
+  "a3_stage_main_kv": true,
+  "transfer_backend": "memfabric",
+  "memfabric_transfer_protocol": "device_rdma"
+}
+```
+
+Use `--kv-cache-dtype int8` on both nodes. The consumer needs one additional
+32 MiB staging window per TP rank, plus up to 2 MiB for alignment.
+It copies Main KV from this device window to Host and reads Indexer data directly
+into device memory. A layer is acknowledged after both transfers complete.
+The tested W4A8C8 configuration uses PP2/PCP4/TP2 with MTP1 on Prefill and
+DP8/TP2 with MTP5 on Decode. The reference run uses the following Decode option.
+
+```bash
+--attention_config.hisparse_config '{"device_buffer_size":12288,"eager_host_mirror":false}'
+```
+
+This selects the existing deferred Host mirror policy. Grouped MTP
+verification can still mirror rows eagerly. Use an arch22 resolver with enough
+scratch space for the configured MTP depth and HiSparse hot buffer.

@@ -23,12 +23,13 @@ from typing import TYPE_CHECKING, Any
 import regex as re
 import torch
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_rank, get_tp_group
+from vllm.distributed import get_pcp_group, get_pp_group, get_tensor_model_parallel_rank, get_tp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.kv_cache_interface import KVCacheConfig
 
+from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.a3_host_staging import validate_packed_main
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.dspark_context import (
     DSparkContextDescriptor,
     DSparkContextReceiver,
@@ -42,6 +43,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.protocol import (
     LayerMetadata,
     SendTask,
     get_external_request_id,
+    hisparse_target_enabled,
     infer_sfa_component_group_ids,
 )
 from vllm_ascend.distributed.kv_transfer.kv_p2p.sfa_pd_rd2h.read_thread import (
@@ -99,14 +101,16 @@ def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
     return extra.get("transfer_backend", BACKEND_MEMFABRIC)
 
 
-def _resolve_memfabric_transfer_protocol(vllm_config: VllmConfig) -> str | None:
-    """Read the optional MemFabric data-path protocol.
-
-    Read from ``kv_connector_extra_config["memfabric_transfer_protocol"]``:
-    ``sdma``/``device_rdma`` for A3 nodes, ``device_urma`` for 950PR&950DT Products.
-    """
+def _configure_layerwise_transport(vllm_config: VllmConfig, role: str) -> None:
+    """Configure the MemFabric engine before any layer buffers are registered."""
     extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-    return extra.get("memfabric_transfer_protocol")
+    global_memfabric_te.configure(
+        role=role,
+        device_id=torch.npu.current_device(),
+        transfer_protocol=extra.get("memfabric_transfer_protocol"),
+        host_rdma_ip=extra.get("memfabric_host_rdma_ip"),
+        host_rdma_port_base=extra.get("memfabric_host_rdma_port_base"),
+    )
 
 
 def _validate_tcp_port(port: int, *, description: str) -> None:
@@ -115,6 +119,8 @@ def _validate_tcp_port(port: int, *, description: str) -> None:
 
 
 class SFAPDRD2HConsumerWorker:
+    _hisparse_target = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -124,6 +130,8 @@ class SFAPDRD2HConsumerWorker:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.use_layerwise = use_layerwise
+        extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
+        self._hisparse_target = hisparse_target_enabled(extra)
         self.tp_rank = get_tensor_model_parallel_rank()  # TP-local rank for the per-rank ZMQ port
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.side_channel_host = get_ip()
@@ -214,11 +222,7 @@ class SFAPDRD2HConsumerWorker:
                 raise RuntimeError(
                     "SfaRemoteD2HConnector D side supports MemFabric pull only (set transfer_backend=memfabric)."
                 )
-            global_memfabric_te.configure(
-                role=MEMFABRIC_ROLE_DECODE,
-                device_id=torch.npu.current_device(),
-                transfer_protocol=_resolve_memfabric_transfer_protocol(self.vllm_config),
-            )
+            _configure_layerwise_transport(self.vllm_config, MEMFABRIC_ROLE_DECODE)
             self.engine = global_memfabric_te.get_transfer_engine(self.side_channel_host)
         return self.engine
 
@@ -249,6 +253,8 @@ class SFAPDRD2HConsumerWorker:
                 indexer_ids = list(getattr(req, "indexer_block_ids", []) or [])
                 self._dest_blocks_by_req[ext_id] = (main_ids, indexer_ids)
                 self._cpu_blocks_by_req[req_id] = len(main_ids)
+                if self._hisparse_target:
+                    self._dspark_pending_recv.add(req_id)
                 descriptor = getattr(req, "dspark_context_descriptor", None)
                 if descriptor is not None:
                     receiver = self._dspark_context_receiver
@@ -309,6 +315,7 @@ class SFAPDRD2HConsumerWorker:
             if receiver is not None:
                 # Check transfer ownership before dropping any DMA destination.
                 receiver.discard_request_id(ext_id)
+            if receiver is not None or self._hisparse_target:
                 self._dspark_pending_recv.discard(req_id)
                 self._deferred_finished_req_ids.discard(req_id)
             self._cpu_blocks_by_req.pop(req_id, None)
@@ -364,6 +371,10 @@ class SFAPDRD2HConsumerWorker:
         tp_status = self._gather_tp_read_status(local_terminal, local_failed)
         finished_on_all = set.intersection(*(terminal for terminal, _ in tp_status)) if tp_status else set()
         failed_on_any = set().union(*(failed for _, failed in tp_status))
+        if self._hisparse_target and failed_on_any:
+            # A failed synchronous read gives no guarantee about work from other
+            # ranks. Stop before returning partially written pages to the allocator.
+            raise RuntimeError(f"Layerwise HiSparse remote read failed: {sorted(failed_on_any)}")
         if receiver is not None:
             for ext_id in finished_on_all - failed_on_any:
                 descriptor = receiver.get_descriptor(ext_id)
@@ -418,7 +429,7 @@ class SFAPDRD2HConsumerWorker:
         # resolution loop above, leaking any finished req whose DONE arrives in
         # the same step (unmappable -> stuck in _pending_done forever).
         done_sending: set[str] = set()
-        if receiver is not None:
+        if receiver is not None or self._hisparse_target:
             self._dspark_pending_recv.difference_update(done_recving)
             self._deferred_finished_req_ids.update(finished_req_ids or ())
             # Cancellation does not abort the remote reads. Keep their lookup
@@ -655,26 +666,36 @@ class SFAPDRD2HProducerWorker:
     can read P's source blocks and reply with READ_DONE / READ_FAILED.
     """
 
+    _hisparse_target = False
+    _pcp_replica = False
+    _a3_staged = False
+
     def __init__(self, vllm_config: VllmConfig, kv_cache_config: KVCacheConfig, engine_id: str):
         # Preserve the Mooncake worker's transfer-engine timeout setup. The
         # memfabric engine reads this during construction.
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         self._backend = _resolve_kv_transfer_backend(vllm_config)
+        self._hisparse_target = hisparse_target_enabled(vllm_config.kv_transfer_config.kv_connector_extra_config or {})
         if self._backend != BACKEND_MEMFABRIC:
             raise RuntimeError(
                 "SfaRemoteD2HConnector P side supports MemFabric pull only (set transfer_backend=memfabric)."
             )
-        global_memfabric_te.configure(
-            role=MEMFABRIC_ROLE_PREFILL,
-            device_id=torch.npu.current_device(),
-            transfer_protocol=_resolve_memfabric_transfer_protocol(vllm_config),
-        )
+        _configure_layerwise_transport(vllm_config, MEMFABRIC_ROLE_PREFILL)
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.engine_id = engine_id
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self._a3_staged = (vllm_config.kv_transfer_config.kv_connector_extra_config or {}).get(
+            "a3_stage_main_kv", False
+        )
+        # DCP1 replicates the gathered KV on each PCP rank. Publish once per PP/TP pair.
+        self._pcp_replica = (
+            self._a3_staged
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
+            and get_pcp_group().rank_in_group != 0
+        )
         self.pp_rank = get_pp_group().rank_in_group
         self.pp_size = vllm_config.parallel_config.pipeline_parallel_size
         self.side_channel_host = get_ip()
@@ -738,6 +759,8 @@ class SFAPDRD2HProducerWorker:
 
         ``remote_host`` / ``local_block_ids`` are already correct from
         ``build_connector_meta``; main and indexer group ids remain separate."""
+        if self._pcp_replica:
+            return
         if self._backend == BACKEND_MEMFABRIC:
             self.current_layer = 0
             self._pd_dispatched_layers = set()
@@ -755,6 +778,8 @@ class SFAPDRD2HProducerWorker:
                     decode_tp_size=remote_tp_size,
                     prefill_tp_rank=self.tp_rank,
                 )
+                if self._hisparse_target and remote_tp_size != self.tp_size:
+                    raise ValueError("Layerwise HiSparse requires equal Prefill and Decode TP")
                 tp_ratio = self.tp_size // remote_tp_size
                 req_meta.tp_ratio = tp_ratio
                 req_meta.group_member_idx = self.tp_rank % tp_ratio
@@ -818,6 +843,7 @@ class SFAPDRD2HProducerWorker:
             layer_storage_slots=self.layer_storage_slots,
             producer_pp_rank=self.pp_rank,
             producer_pp_size=self.pp_size,
+            include_computed_tokens=self._hisparse_target,
         )
 
     @staticmethod
@@ -841,6 +867,8 @@ class SFAPDRD2HProducerWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only.
+        if self._pcp_replica:
+            return
         assert self._backend == BACKEND_MEMFABRIC, "SfaRemoteD2HConnector P side supports memfabric pull only."
         layer2group_ids: dict[str, int] = {}
         for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
@@ -863,6 +891,8 @@ class SFAPDRD2HProducerWorker:
             if not isinstance(cache_or_caches, (list, tuple)):
                 cache_or_caches = (cache_or_caches,)
             for single_kv_cache in cache_or_caches:
+                if self._hisparse_target and not single_kv_cache.is_contiguous():
+                    raise ValueError("Layerwise HiSparse Prefill sources must have contiguous per-component pages")
                 tensor_num_blocks = single_kv_cache.shape[0]
                 if tensor_num_blocks % num_blocks != 0:
                     raise ValueError("The external block size must be an integer multiple of the kernel block size.")
@@ -870,15 +900,26 @@ class SFAPDRD2HProducerWorker:
                 layer_meta.kv_caches_base_addr.append(single_kv_cache.data_ptr())
                 layer_meta.block_len.append(single_kv_cache.element_size() * math.prod(single_kv_cache.shape[1:]))
                 layer_meta.block_size_scale.append(tensor_num_blocks // num_blocks)
+                if self._hisparse_target:
+                    layer_meta.block_shapes.append(tuple(single_kv_cache.shape[1:]))
+                    layer_meta.num_logical_blocks.append(num_blocks)
 
         for physical_idx, main_name in sorted(main_by_layer.items()):
             layer_meta = LayerMetadata([], [], [], [])
             _append_cache_tensors(layer_meta, target_caches[main_name], layer2group_ids[main_name])
             layer_meta.main_tensor_count = len(layer_meta.kv_caches_base_addr)
-            if layer_meta.main_tensor_count != 2:
+            if self._a3_staged:
+                validate_packed_main(
+                    target_caches[main_name],
+                    layer_meta.block_len[0] * layer_meta.block_size_scale[0],
+                    self.block_size[self.main_group_idx],
+                )
+                layer_meta.packed_int8_c8 = True
+            allowed_counts = (1, 2) if self._hisparse_target else (2,)
+            if layer_meta.main_tensor_count not in allowed_counts:
                 raise RuntimeError(
-                    f"SFAPD producer layer {main_name} must expose main K/V tensors, "
-                    f"got {layer_meta.main_tensor_count} tensor(s)"
+                    f"SFAPD producer layer {main_name} has {layer_meta.main_tensor_count} main tensors, "
+                    f"expected one of {allowed_counts}"
                 )
             indexer_name = indexer_by_layer.get(physical_idx)
             if indexer_name is not None:
@@ -1078,6 +1119,8 @@ class SFAPDRD2HProducerWorker:
         connector_metadata: KVConnectorMetadata,
         **kwargs,
     ) -> None:
+        if self._pcp_replica:
+            return
         if self._backend != BACKEND_MEMFABRIC:
             raise RuntimeError("SfaRemoteD2HConnector P side supports memfabric pull only.")
         send_thread = self.kv_send_layer_thread
@@ -1196,8 +1239,15 @@ class SFAPDRD2HProducerWorker:
                     f"physical KV storage slot {slot_id} for layer {layer_idx}",
                 )
 
+    def wait_for_save(self) -> None:
+        """Keep this step's source pages live until Decode acknowledges its last reads."""
+        for layer_idx in self._pd_dispatched_layers:
+            self.wait_for_layer_send(layer_idx)
+
     def wait_for_layer_reuse(self, stage_local_layer_idx: int) -> None:
         """Translate AscendStore's stage-local ordinal to a global layer."""
+        if self._pcp_replica:
+            return
         try:
             global_layer_idx = _layer_idx(self.stage_layer_names[stage_local_layer_idx])
         except IndexError as error:

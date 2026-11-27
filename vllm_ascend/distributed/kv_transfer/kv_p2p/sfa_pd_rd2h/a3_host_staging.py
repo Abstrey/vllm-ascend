@@ -54,12 +54,7 @@ def validate_a3_staging(config, extra, *, hisparse_target: bool, is_producer: bo
 
 def validate_packed_main(tensors, page_bytes: int, page_tokens: int) -> None:
     views = tensors if isinstance(tensors, (tuple, list)) else (tensors,)
-    if (
-        len(views) != 1
-        or views[0].dtype != torch.int8
-        or page_tokens <= 0
-        or page_bytes != page_tokens * C8_ROW_BYTES
-    ):
+    if len(views) != 1 or views[0].dtype != torch.int8 or page_tokens <= 0 or page_bytes != page_tokens * C8_ROW_BYTES:
         raise ValueError("Expected one packed INT8 C8 page for A3 layerwise transfer")
 
 
@@ -97,7 +92,9 @@ class A3HostKVStaging:
                     raise RuntimeError(f"A3 Main KV staged RDMA read failed with code {result}")
                 try:
                     for begin, offset, _, length in batch:
-                        host_bytes[offset : offset + length].copy_(self.buffer[begin : begin + length], non_blocking=True)
+                        host_bytes[offset : offset + length].copy_(
+                            self.buffer[begin : begin + length], non_blocking=True
+                        )
                 finally:
                     # Finish any queued copies before reusing the RDMA window, also on error.
                     self.stream.synchronize()
